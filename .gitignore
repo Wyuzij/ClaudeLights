@@ -1,0 +1,18 @@
+# Runtime
+status-*.json
+.pid-*
+.map-*
+
+# Build
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# Claude Code local config
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
