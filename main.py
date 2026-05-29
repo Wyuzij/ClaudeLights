@@ -1,11 +1,18 @@
 """
 ClaudeLights — 3D 玻璃质感桌宠信号灯
 统一入口: server 模式 (渲染灯) + CLI 模式 (管理)
+
+生命周期完全由 CC hooks 驱动:
+- UserPromptSubmit/PreToolUse → 首次触发懒创建灯, 后续更新状态为 working
+- Stop → success (灯亮绿色, 会话继续)
+- StopFailure → error (灯亮红色)
+- SessionEnd → shutdown (灯立即退出)
+- 心跳 30s 超时 → 异常退出兜底 (hook 进程被 kill 前来不及写 shutdown)
 """
 import json, os, sys, time, math, glob, subprocess, socket, ctypes, argparse, threading
 
 # ============================================================
-# CLI 模式 (lights.py)
+# CLI 模式
 # ============================================================
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -34,17 +41,19 @@ def _write(lid, status, msg=""):
         json.dump({"status": status, "message": msg, "heartbeat": time.time()}, f, ensure_ascii=False)
 
 def _check_alive(pid):
-    """返回 (certain, alive)。certain=False 时无法确定进程状态(如MSYS2 PID)。"""
+    """返回 (certain, alive)。用 WaitForSingleObject 精确判断进程死活。"""
     try:
         k32 = ctypes.windll.kernel32
-        h = k32.OpenProcess(0x0400, False, pid)
+        h = k32.OpenProcess(0x00100000, False, pid)
         if not h:
             err = k32.GetLastError()
-            if err in (87, 5):
-                return False, True  # 不确定, 乐观假设存活
-            return True, False  # 其他错误 → 确认已死
-        code = ctypes.c_ulong(); k32.GetExitCodeProcess(h, ctypes.byref(code)); k32.CloseHandle(h)
-        alive = code.value == 259
+            if err == 5:  # ACCESS_DENIED → 进程存在但无权限
+                return False, True
+            return True, False
+        WAIT_TIMEOUT = 0x00000102
+        ret = k32.WaitForSingleObject(h, 0)
+        k32.CloseHandle(h)
+        alive = ret == WAIT_TIMEOUT
         return True, alive
     except: return False, True
 
@@ -52,23 +61,68 @@ def _is_alive(pid):
     _, alive = _check_alive(pid)
     return alive
 
-def cmd_start():
-    ap = argparse.ArgumentParser(); ap.add_argument("--id", default=None); ap.add_argument("--session-pid", type=int, default=0)
-    ns, _ = ap.parse_known_args(sys.argv[2:])
-    lid = ns.id or _next_id(); sp = ns.session_pid or 0
-    _write(lid, "idle", "Ready")
-    # 映射: 会话PID → 灯ID (供 hook 进程树查找)
-    if sp:
-        with open(os.path.join(BASE, f".map-{sp}"), "w") as f: f.write(lid)
+def _find_my_light():
+    """
+    查找当前 CC 会话的信号灯 ID。
+    纯心跳匹配 — 不依赖进程树 (进程树对 VSCode 无效, CC hooks 运行在 VS 子进程中)。
+    优先级: env var → 心跳扫描 (最近30s内有心跳的活灯)
+    """
+    # 1. env var (PS profile 设置, 终端模式最可靠)
+    lid = os.environ.get("CLAUDE_LIGHTS_ID", "")
+    if lid and os.path.exists(_pidf(lid)):
+        try:
+            with open(_pidf(lid)) as f:
+                if _is_alive(int(f.read().strip())):
+                    return lid
+        except: pass
+    # 2. 心跳扫描: 找最近30s内有心跳的活 server
+    best_lid, best_hb = "", 0
+    now = time.time()
+    for pidf in glob.glob(os.path.join(BASE, ".pid-*")):
+        try:
+            with open(pidf) as f: server_pid = int(f.read().strip())
+        except: continue
+        if _is_alive(server_pid):
+            lid = os.path.basename(pidf).replace(".pid-", "")
+            hb = _read_heartbeat(lid)
+            if hb > 0 and now - hb < 30 and hb > best_hb:
+                best_lid, best_hb = lid, hb
+    return best_lid
+
+def _lazy_start(lid_hint, status, msg):
+    """
+    懒创建信号灯: 新 CC 会话首次 hook 触发时自动创建。
+    先扫已有活灯复用 (VSCode 多终端共享一个 VS 实例), 没有再创建。
+    """
+    # 复用已有活灯 (同 VS 实例的其他终端已创建)
+    for pidf in glob.glob(os.path.join(BASE, ".pid-*")):
+        try:
+            with open(pidf) as f: server_pid = int(f.read().strip())
+        except: continue
+        if _is_alive(server_pid):
+            return os.path.basename(pidf).replace(".pid-", "")
+    # 创建新灯
+    lid = lid_hint or _next_id()
+    _write(lid, status, msg)
     cmdline = [sys.executable, __file__, "server", "--id", lid]
-    if sp: cmdline += ["--session-pid", str(sp)]
+    proc = subprocess.Popen(cmdline, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform=="win32" else 0)
+    with open(_pidf(lid), "w") as f: f.write(str(proc.pid))
+    return lid
+
+def cmd_start():
+    ap = argparse.ArgumentParser(); ap.add_argument("--id", default=None)
+    ns, _ = ap.parse_known_args(sys.argv[2:])
+    lid = ns.id or _next_id()
+    _write(lid, "idle", "Ready")
+    cmdline = [sys.executable, __file__, "server", "--id", lid]
     proc = subprocess.Popen(cmdline, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform=="win32" else 0)
     with open(_pidf(lid), "w") as f: f.write(str(proc.pid))
     print(f"  {lid} 已启动 (PID={proc.pid})")
 
 def cmd_stop():
-    ap = argparse.ArgumentParser(); ap.add_argument("id"); ns, _ = ap.parse_known_args()
+    ap = argparse.ArgumentParser(); ap.add_argument("id"); ns, _ = ap.parse_known_args(sys.argv[2:])
     _write(ns.id, "shutdown")
     waited = 0.0
     while waited < 4.0:
@@ -84,12 +138,6 @@ def cmd_stop():
         if os.path.exists(p):
             try: os.remove(p)
             except: pass
-    # 清理映射文件
-    for mf in glob.glob(os.path.join(BASE, ".map-*")):
-        try:
-            with open(mf) as f: mid = f.read().strip()
-            if mid == ns.id: os.remove(mf)
-        except: pass
     print(f"  {ns.id} 已停止")
 
 def cmd_set():
@@ -128,178 +176,21 @@ def cmd_broadcast():
         with open(f, "w", encoding="utf-8") as fh:
             json.dump({"status": ns.status, "message": ns.message}, fh, ensure_ascii=False)
 
-def _snapshot():
-    """获取进程快照列表 [(pid, ppid, name)]"""
-    try:
-        TH32CS_SNAPPROCESS = 0x02
-        class PE(ctypes.Structure):
-            _fields_ = [("sz",ctypes.c_ulong),("u",ctypes.c_ulong),("pid",ctypes.c_ulong),
-                        ("d1",ctypes.c_void_p),("d2",ctypes.c_ulong),("t",ctypes.c_ulong),
-                        ("ppid",ctypes.c_ulong),("p",ctypes.c_long),("f",ctypes.c_ulong),
-                        ("e",ctypes.c_char*260)]
-        k32 = ctypes.windll.kernel32
-        snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-        if snap == -1: return []
-        result = []
-        e = PE(); e.sz = ctypes.sizeof(PE)
-        if k32.Process32First(snap, ctypes.byref(e)):
-            while True:
-                name = e.e.decode("utf-8", errors="ignore") if e.e else ""
-                result.append((e.pid, e.ppid, name))
-                if not k32.Process32Next(snap, ctypes.byref(e)): break
-        k32.CloseHandle(snap)
-        return result
-    except: return []
-
-
-def _find_cc_anchor():
-    """
-    沿进程树向上找 CC 进程做会话锚点。
-    返回 (anchor_pid, anchor_name)。anchor_pid 在同一 CC 会话的多次 hook 调用间稳定。
-    """
-    snap = {p: (pp, n) for p, pp, n in _snapshot()}
-    pid = os.getpid()
-    # 先找 claude.exe/node.exe — 这是最可靠的锚点
-    for _ in range(12):
-        info = snap.get(pid)
-        if not info: break
-        ppid, name = info[0], (info[1] or "")
-        if not ppid: break
-        nl = name.lower()
-        if "claude" in nl or ("node" in nl and "claude" not in nl):
-            return ppid, name
-        pid = ppid
-    # 回退: 用当前进程的顶级非系统父进程
-    pid = os.getpid()
-    for _ in range(8):
-        info = snap.get(pid)
-        if not info: break
-        ppid, name = info[0], info[1] or ""
-        if not ppid: break
-        nl = name.lower()
-        # 跳过系统进程, 找到第一个"有意义"的父进程
-        if nl and nl not in ("cmd.exe", "bash.exe", "pwsh.exe", "powershell.exe", "conhost.exe",
-                             "svchost.exe", "winlogon.exe", "csrss.exe", "smss.exe", ""):
-            if "cmd" not in nl:  # cmd.exe 太通用, 继续向上
-                return ppid, name
-        pid = ppid
-    return os.getppid(), ""
-
-
-def _find_my_light():
-    """查找当前 CC 会话的信号灯 ID"""
-    # 1. env var
-    lid = os.environ.get("CLAUDE_LIGHTS_ID", "")
-    if lid: return lid
-    # 2. 进程树锚点查找
-    anchor, _ = _find_cc_anchor()
-    if anchor:
-        mf = os.path.join(BASE, f".map-{anchor}")
-        if os.path.exists(mf):
-            try:
-                with open(mf) as f: return f.read().strip()
-            except: pass
-        # 也检查父进程 PID (兼容旧版 .map 文件)
-        pid = os.getpid()
-        for _ in range(10):
-            snap = {p: (pp, n) for p, pp, n in _snapshot()}
-            info = snap.get(pid)
-            if not info: break
-            pid = info[0]
-            if not pid: break
-            mf = os.path.join(BASE, f".map-{pid}")
-            if os.path.exists(mf):
-                try:
-                    with open(mf) as f: return f.read().strip()
-                except: pass
-    # 3. 兜底: 扫描所有活着的 server 进程, 按心跳取最新
-    # (VSCode 环境下每次 hook 调用的锚点 PID 不同, 步骤2会失败)
-    candidates = {}
-    # 从 .pid-* 文件找 (server 已启动)
-    for pidf in glob.glob(os.path.join(BASE, ".pid-*")):
-        try:
-            with open(pidf) as f: server_pid = int(f.read().strip())
-        except: continue
-        if _is_alive(server_pid):
-            lid = os.path.basename(pidf).replace(".pid-", "")
-            hb = _read_heartbeat(lid)
-            if lid not in candidates or hb > candidates[lid]:
-                candidates[lid] = hb
-    # 从 .map-* + status 文件找 (server 尚未启动完成的竞态窗口)
-    for mf in glob.glob(os.path.join(BASE, ".map-*")):
-        try:
-            with open(mf) as f: lid = f.read().strip()
-        except: continue
-        if lid in candidates: continue
-        hb = _read_heartbeat(lid)
-        if hb > 0 and time.time() - hb < 30:  # 30秒内有心跳, 说明被其他 hook 刚创建
-            candidates[lid] = hb
-    if candidates:
-        lid = max(candidates, key=candidates.get)
-        # 用当前 anchor 重写映射, 加速后续查找
-        if anchor:
-            with open(os.path.join(BASE, f".map-{anchor}"), "w") as f: f.write(lid)
-        return lid
-    return ""
-
-
-def _lazy_start(lid_hint, status, msg):
-    """
-    懒创建信号灯: 新 CC 会话首次 hook 触发时自动创建。
-    用 CC 进程 PID 做锚点，同一会话多次 hook 调用绑定同一灯。
-    """
-    anchor, _ = _find_cc_anchor()
-    mf = os.path.join(BASE, f".map-{anchor}") if anchor else ""
-    # 检查是否已有映射 (竞态保护)
-    if mf and os.path.exists(mf):
-        try:
-            with open(mf) as f: return f.read().strip()
-        except: pass
-    # 兜底: 扫描活着的 server, 复用已有灯 (VSCode 锚点不稳定)
-    for pidf in glob.glob(os.path.join(BASE, ".pid-*")):
-        try:
-            with open(pidf) as f: server_pid = int(f.read().strip())
-        except: continue
-        if _is_alive(server_pid):
-            lid = os.path.basename(pidf).replace(".pid-", "")
-            if anchor:
-                with open(mf, "w") as f: f.write(lid)
-            return lid
-    # 竞态窗口: server 尚未启动完成(.pid-*未写入), 但 status 文件已有心跳
-    for mapf in glob.glob(os.path.join(BASE, ".map-*")):
-        try:
-            with open(mapf) as f: lid = f.read().strip()
-        except: continue
-        hb = _read_heartbeat(lid)
-        if hb > 0 and time.time() - hb < 30:
-            if anchor:
-                with open(mf, "w") as f: f.write(lid)
-            return lid
-    # 创建新灯
-    lid = lid_hint or _next_id()
-    _write(lid, status, msg)
-    if anchor:
-        with open(mf, "w") as f: f.write(lid)
-    cmdline = [sys.executable, __file__, "server", "--id", lid]
-    if anchor: cmdline += ["--session-pid", str(anchor)]
-    proc = subprocess.Popen(cmdline, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform=="win32" else 0)
-    with open(_pidf(lid), "w") as f: f.write(str(proc.pid))
-    return lid
-
-
 def cmd_hook():
+    """
+    CC hook 入口。所有 hook 事件 (PreToolUse, Stop, SessionEnd 等) 都走这里。
+    生命周期:
+    - 首次 hook → 懒创建灯 + 写状态
+    - 后续 hook → 找已有灯 + 写状态
+    - SessionEnd 传 shutdown → 灯进程读到后立即退出
+    """
     ap = argparse.ArgumentParser(); ap.add_argument("status"); ap.add_argument("message", nargs="?", default="")
     ns, _ = ap.parse_known_args(sys.argv[2:])
-    # 1. env var (PS profile 设置)
-    lid = os.environ.get("CLAUDE_LIGHTS_ID", "")
-    # 2. 进程树查找 (持久化映射)
-    if not lid: lid = _find_my_light()
-    # 3. 懒创建: 新 CC 会话首次触发时自动创建灯
+    lid = _find_my_light()
     if not lid:
         lid = _lazy_start(None, ns.status, ns.message)
         if lid:
-            return  # 已写入初始状态, 不需要再写
+            return  # _lazy_start 已写入初始状态
     if lid: _write(lid, ns.status, ns.message)
     else: cmd_broadcast()
 
@@ -311,7 +202,7 @@ def cmd_shutdown():
 
 
 # ============================================================
-# Server 模式 (light_server.py - PySide6 渲染)
+# Server 模式 (PySide6 渲染)
 # ============================================================
 def server_main():
     from PySide6.QtCore import Qt, QTimer, QPointF
@@ -322,19 +213,19 @@ def server_main():
     WW, WH = 54, 152
     POLL_MS = 350
     WINDOW_OPACITY = 0.92
+    HEARTBEAT_TIMEOUT = 30  # 30s 无心跳 → 会话异常退出, 兜底关闭
     SOCKET = QColor(0x10, 0x10, 0x16)
-    OFF = [QColor(0x40,0x1A,0x1E), QColor(0x30,0x2A,0x16), QColor(0x14,0x28,0x1A)]
-    ON  = [QColor(0xFF,0x30,0x30), QColor(0xFF,0xD4,0x10), QColor(0x28,0xFF,0x50)]
+    OFF = [QColor(0x08,0x08,0x0A), QColor(0x08,0x08,0x0A), QColor(0x08,0x08,0x0A)]
+    ON  = [QColor(0xFF,0x10,0x10), QColor(0xFF,0xDC,0x00), QColor(0x00,0xFF,0x30)]
     LIGHT_Y = [47, 83, 119]
     LIGHT_R = 13.5
-    PULSE = {"idle":(0.010,0.08,0.22), "working":(0.045,0.28,0.40),
-             "success":(0.06,0.44,0.52), "error":(0.08,0.42,0.44)}
+    PULSE = {"idle":(0.010,0.08,0.30), "working":(0.055,0.34,0.44),
+             "success":(0.08,0.50,0.56), "error":(0.10,0.48,0.48)}
 
     ap = argparse.ArgumentParser()
     ap.add_argument("server", nargs="?"); ap.add_argument("--id", required=True)
-    ap.add_argument("--session-pid", type=int, default=0)
     ns = ap.parse_args()
-    lid = ns.id; sp = ns.session_pid
+    lid = ns.id
 
     sf = _sf(lid)
     if not os.path.exists(sf):
@@ -343,7 +234,7 @@ def server_main():
     class SignalWidget(QWidget):
         def __init__(self):
             super().__init__()
-            self.lid = lid; self.sf = sf; self._ppid = sp
+            self.lid = lid; self.sf = sf
             self.status = "idle"; self.age = 0.0; self.phase = 0.0
             self.cur = [OFF[i] for i in range(3)]
             self.tgt = [OFF[i] for i in range(3)]
@@ -358,7 +249,6 @@ def server_main():
             self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             self.setStyleSheet("background: transparent;")
             self.setWindowOpacity(WINDOW_OPACITY)
-            # Windows API: WS_EX_TRANSPARENT 比 Qt 属性更可靠
             if sys.platform == "win32":
                 hwnd = int(self.winId())
                 GWL_EXSTYLE = -20
@@ -415,42 +305,32 @@ def server_main():
                 if os.path.exists(p):
                     try: os.remove(p)
                     except: pass
-            # 清理映射文件
-            for mf in glob.glob(os.path.join(BASE, ".map-*")):
-                try:
-                    with open(mf) as f:
-                        if f.read().strip() == self.lid:
-                            os.remove(mf)
-                except: pass
 
         def _read(self):
-            if self._ppid:
-                certain, alive = _check_alive(self._ppid)
-                if certain and not alive:
-                    self._cleanup(); QApplication.quit(); return
+            """
+            纯状态文件驱动 — 不依赖进程树。
+            SessionEnd hook 写 shutdown → 立即退出。
+            心跳超时 → 异常退出兜底 (hook 进程被 kill 前来不及写 shutdown)。
+            """
             try:
                 with open(self.sf,"r",encoding="utf-8") as f: d = json.load(f)
             except: return
             s = d.get("status","idle")
-            if s=="shutdown": self._cleanup(); QApplication.quit(); return
-            # 心跳兜底: 无法确认父进程状态时(如MSYS2/VSCode), 超时自清理
-            if self._ppid:
-                certain, alive = _check_alive(self._ppid)
-                if not certain:
-                    hb = d.get("heartbeat", 0)
-                    if hb and time.time() - hb > 600:
-                        self._cleanup(); QApplication.quit(); return
+            if s == "shutdown":
+                self._cleanup(); QApplication.quit(); return
+            hb = d.get("heartbeat", 0)
+            if hb and time.time() - hb > HEARTBEAT_TIMEOUT:
+                self._cleanup(); QApplication.quit(); return
             if s != self.status:
                 self.status = s
                 self.age = 0.0
-                p = PULSE.get(s,PULSE["idle"])
-                self._tspd,self._tamp,self._tbase = p
+                p = PULSE.get(s, PULSE["idle"])
+                self._tspd, self._tamp, self._tbase = p
 
         def paintEvent(self, e):
             p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
             glow = self._glow(); cx = WW/2; rr = 15.0
 
-            # 投影
             shadow = QPainterPath()
             shadow.addRoundedRect(2, 16, WW-4, WH-18, rr, rr)
             p.fillPath(shadow, QColor(0,0,0,35))
@@ -507,28 +387,32 @@ def server_main():
                 p.setBrush(sg); p.drawEllipse(QPointF(cx, cy), sr-0.5, sr-0.5)
 
                 cur = self.cur[i]
-                for gr, ab in [(LIGHT_R+15,0.020),(LIGHT_R+12,0.035),(LIGHT_R+9,0.055),(LIGHT_R+6,0.080),(LIGHT_R+3.5,0.110),(LIGHT_R+1.2,0.150)]:
+                for gr, ab in [(LIGHT_R+24,0.006),(LIGHT_R+21,0.010),(LIGHT_R+18,0.016),
+                               (LIGHT_R+15.5,0.024),(LIGHT_R+13,0.035),(LIGHT_R+10.5,0.050),
+                               (LIGHT_R+8,0.070),(LIGHT_R+6,0.095),(LIGHT_R+4.2,0.125),
+                               (LIGHT_R+2.8,0.160),(LIGHT_R+1.5,0.200)]:
                     a = int(ab * glow * 255)
                     p.setBrush(QColor(cur.red(), cur.green(), cur.blue(), a))
                     p.drawEllipse(QPointF(cx, cy), gr, gr)
 
                 bulb = QRadialGradient(QPointF(cx-3.5, cy-4.5), LIGHT_R*1.25)
-                bulb.setColorAt(0.00, QColor(min(255,cur.red()+70), min(255,cur.green()+70), min(255,cur.blue()+70)))
-                bulb.setColorAt(0.10, QColor(min(255,cur.red()+45), min(255,cur.green()+45), min(255,cur.blue()+45)))
-                bulb.setColorAt(0.25, QColor(min(255,cur.red()+18), min(255,cur.green()+18), min(255,cur.blue()+18)))
-                bulb.setColorAt(0.50, cur)
-                bulb.setColorAt(0.70, QColor(max(0,cur.red()-35), max(0,cur.green()-35), max(0,cur.blue()-35)))
-                bulb.setColorAt(0.88, QColor(max(0,cur.red()-55), max(0,cur.green()-55), max(0,cur.blue()-55)))
-                bulb.setColorAt(1.00, QColor(max(0,cur.red()-75), max(0,cur.green()-75), max(0,cur.blue()-75)))
+                bulb.setColorAt(0.00, QColor(min(255,cur.red()+140), min(255,cur.green()+140), min(255,cur.blue()+140)))
+                bulb.setColorAt(0.08, QColor(min(255,cur.red()+80), min(255,cur.green()+80), min(255,cur.blue()+80)))
+                bulb.setColorAt(0.18, QColor(min(255,cur.red()+30), min(255,cur.green()+30), min(255,cur.blue()+30)))
+                bulb.setColorAt(0.35, cur)
+                bulb.setColorAt(0.55, QColor(max(0,cur.red()-30), max(0,cur.green()-30), max(0,cur.blue()-30)))
+                bulb.setColorAt(0.75, QColor(max(0,cur.red()-55), max(0,cur.green()-55), max(0,cur.blue()-55)))
+                bulb.setColorAt(0.92, QColor(max(0,cur.red()-80), max(0,cur.green()-80), max(0,cur.blue()-80)))
+                bulb.setColorAt(1.00, QColor(0,0,0,0))
                 p.setBrush(bulb); p.drawEllipse(QPointF(cx, cy), LIGHT_R, LIGHT_R)
 
-                p.setBrush(QColor(255,255,255,55))
+                p.setBrush(QColor(255,255,255,75))
                 p.drawEllipse(QPointF(cx-4.5, cy-6), 3.5, 2.0)
-                p.setBrush(QColor(255,255,255,28))
+                p.setBrush(QColor(255,255,255,40))
                 p.drawEllipse(QPointF(cx-3.5, cy-5), 2.2, 1.2)
-                if glow > 0.15:
-                    p.setBrush(QColor(255,255,255, int(glow*22)))
-                    p.drawEllipse(QPointF(cx+2.5, cy+6), 4.2, 1.8)
+                if glow > 0.12:
+                    p.setBrush(QColor(255,255,255, int(glow*32)))
+                    p.drawEllipse(QPointF(cx+2.5, cy+6), 4.5, 2.0)
 
             p.setPen(QColor(0xA8,0xA8,0xB8))
             f0 = QFont("SF Pro Display, Segoe UI, Microsoft YaHei UI", 9)
