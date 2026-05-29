@@ -24,6 +24,7 @@ def _next_id():
 
 def _sf(lid): return os.path.join(BASE, f"status-{lid}.json")
 def _pidf(lid): return os.path.join(BASE, f".pid-{lid}")
+def _mapf(ppid): return os.path.join(BASE, f".map-{ppid}")
 
 def _read_heartbeat(lid):
     """读信号灯的最后心跳时间, 文件不存在或损坏返回0"""
@@ -62,9 +63,9 @@ def _is_alive(pid):
 def _find_my_light():
     """
     查找当前 CC 会话的信号灯 ID。
-    纯心跳匹配 — 不依赖进程树 (进程树对 VSCode 无效, CC hooks 运行在 VS 子进程中)。
-    优先级: env var → 心跳扫描 (最近30s内有心跳的活灯)
+    优先级: env var → 父进程 PID 映射 → 心跳扫描 (跳过已绑定其他会话的灯)
     """
+    ppid = os.getppid()
     # 1. env var (PS profile 设置, 终端模式最可靠)
     lid = os.environ.get("CLAUDE_LIGHTS_ID", "")
     if lid and os.path.exists(_pidf(lid)):
@@ -73,7 +74,37 @@ def _find_my_light():
                 if _is_alive(int(f.read().strip())):
                     return lid
         except: pass
-    # 2. 心跳扫描: 找最近30s内有心跳的活 server
+    # 2. 父进程 PID 映射: hook 进程的父 PID 区分不同 CC 会话
+    mf = _mapf(ppid)
+    if os.path.exists(mf):
+        try:
+            with open(mf) as f: lid = f.read().strip()
+            if os.path.exists(_pidf(lid)):
+                with open(_pidf(lid)) as f:
+                    if _is_alive(int(f.read().strip())):
+                        return lid
+        except: pass
+        # 映射存在但灯已死 → 清理
+        try: os.remove(mf)
+        except: pass
+    # 3. 收集其他会话已认领的灯, 清理过期映射
+    claimed = set()
+    for mp in glob.glob(os.path.join(BASE, ".map-*")):
+        try:
+            map_ppid = int(os.path.basename(mp).replace(".map-", ""))
+        except: continue
+        if map_ppid == ppid:
+            continue  # 自己的映射已在步骤2处理过
+        if _is_alive(map_ppid):
+            # 其他会话还活着 → 标记其灯为己用, 心跳扫描时跳过
+            try:
+                with open(mp) as f: claimed.add(f.read().strip())
+            except: pass
+        else:
+            # 父进程已死 → 清理过期映射
+            try: os.remove(mp)
+            except: pass
+    # 4. 心跳扫描: 找最近30s内有心跳的活 server, 跳过已被其他会话认领的
     best_lid, best_hb = "", 0
     now = time.time()
     for pidf in glob.glob(os.path.join(BASE, ".pid-*")):
@@ -82,6 +113,8 @@ def _find_my_light():
         except: continue
         if _is_alive(server_pid):
             lid = os.path.basename(pidf).replace(".pid-", "")
+            if lid in claimed:
+                continue  # 其他会话的灯, 不碰
             hb = _read_heartbeat(lid)
             if hb > 0 and now - hb < 30 and hb > best_hb:
                 best_lid, best_hb = lid, hb
@@ -90,22 +123,18 @@ def _find_my_light():
 def _lazy_start(lid_hint, status, msg):
     """
     懒创建信号灯: 新 CC 会话首次 hook 触发时自动创建。
-    先扫已有活灯复用 (VSCode 多终端共享一个 VS 实例), 没有再创建。
+    每个 CC 会话用 hook 父进程 PID 区分, 创建 .map-{ppid} 绑定。
     """
-    # 复用已有活灯 (同 VS 实例的其他终端已创建)
-    for pidf in glob.glob(os.path.join(BASE, ".pid-*")):
-        try:
-            with open(pidf) as f: server_pid = int(f.read().strip())
-        except: continue
-        if _is_alive(server_pid):
-            return os.path.basename(pidf).replace(".pid-", "")
-    # 创建新灯
+    ppid = os.getppid()
+    # 创建新灯 (不复用 — 每个 CC 会话独立)
     lid = lid_hint or _next_id()
     _write(lid, status, msg)
     cmdline = [sys.executable, __file__, "server", "--id", lid]
     proc = subprocess.Popen(cmdline, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform=="win32" else 0)
     with open(_pidf(lid), "w") as f: f.write(str(proc.pid))
+    # 绑定: 父进程 PID → 灯 ID
+    with open(_mapf(ppid), "w") as f: f.write(lid)
     return lid
 
 def cmd_start():
@@ -136,6 +165,13 @@ def cmd_stop():
         if os.path.exists(p):
             try: os.remove(p)
             except: pass
+    # 清理指向本灯的 .map-* 映射
+    for mf in glob.glob(os.path.join(BASE, ".map-*")):
+        try:
+            with open(mf) as f:
+                if f.read().strip() == ns.id:
+                    os.remove(mf)
+        except: pass
     print(f"  {ns.id} 已停止")
 
 def cmd_set():
@@ -303,6 +339,13 @@ def server_main():
                 if os.path.exists(p):
                     try: os.remove(p)
                     except: pass
+            # 清理指向本灯的所有 .map-* 映射
+            for mf in glob.glob(os.path.join(BASE, ".map-*")):
+                try:
+                    with open(mf) as f:
+                        if f.read().strip() == self.lid:
+                            os.remove(mf)
+                except: pass
 
         def _read(self):
             """
