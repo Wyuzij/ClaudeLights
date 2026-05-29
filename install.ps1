@@ -1,6 +1,7 @@
 <#
   ClaudeLights 一键安装脚本
   用法: powershell -ExecutionPolicy Bypass -File install.ps1 [-ExePath .\claude-lights.exe]
+  支持: PowerShell 终端 + VSCode Claude Code Agent (自动懒创建)
 #>
 param(
     [string]$InstallDir = "$env:USERPROFILE\.claude-lights",

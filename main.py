@@ -28,10 +28,13 @@ def _is_alive(pid):
     try:
         k32 = ctypes.windll.kernel32
         h = k32.OpenProcess(0x0400, False, pid)
-        if not h: return False
+        if not h:
+            err = k32.GetLastError()
+            # 87=无效PID(MSYS2内部PID), 5=拒绝访问 — 均无法判断, 乐观假设存活
+            return err in (87, 5)
         code = ctypes.c_ulong(); k32.GetExitCodeProcess(h, ctypes.byref(code)); k32.CloseHandle(h)
-        return code.value == 259
-    except: return False
+        return code.value == 259  # STILL_ACTIVE
+    except: return True
 
 def cmd_start():
     ap = argparse.ArgumentParser(); ap.add_argument("--id", default=None); ap.add_argument("--session-pid", type=int, default=0)
@@ -109,47 +112,130 @@ def cmd_broadcast():
         with open(f, "w", encoding="utf-8") as fh:
             json.dump({"status": ns.status, "message": ns.message}, fh, ensure_ascii=False)
 
-def _parent_pid(pid):
-    """获取 Windows 父进程 PID"""
+def _snapshot():
+    """获取进程快照列表 [(pid, ppid, name)]"""
     try:
         TH32CS_SNAPPROCESS = 0x02
         class PE(ctypes.Structure):
             _fields_ = [("sz",ctypes.c_ulong),("u",ctypes.c_ulong),("pid",ctypes.c_ulong),
                         ("d1",ctypes.c_void_p),("d2",ctypes.c_ulong),("t",ctypes.c_ulong),
-                        ("ppid",ctypes.c_ulong),("p",ctypes.c_long),("f",ctypes.c_ulong),("e",ctypes.c_char*260)]
+                        ("ppid",ctypes.c_ulong),("p",ctypes.c_long),("f",ctypes.c_ulong),
+                        ("e",ctypes.c_char*260)]
         k32 = ctypes.windll.kernel32
         snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-        if snap == -1: return 0
+        if snap == -1: return []
+        result = []
         e = PE(); e.sz = ctypes.sizeof(PE)
         if k32.Process32First(snap, ctypes.byref(e)):
             while True:
-                if e.pid == pid: k32.CloseHandle(snap); return e.ppid
+                name = e.e.decode("utf-8", errors="ignore") if e.e else ""
+                result.append((e.pid, e.ppid, name))
                 if not k32.Process32Next(snap, ctypes.byref(e)): break
         k32.CloseHandle(snap)
-    except: pass
-    return 0
+        return result
+    except: return []
+
+
+def _find_cc_anchor():
+    """
+    沿进程树向上找 CC 进程做会话锚点。
+    返回 (anchor_pid, anchor_name)。anchor_pid 在同一 CC 会话的多次 hook 调用间稳定。
+    """
+    snap = {p: (pp, n) for p, pp, n in _snapshot()}
+    pid = os.getpid()
+    # 先找 claude.exe/node.exe — 这是最可靠的锚点
+    for _ in range(12):
+        info = snap.get(pid)
+        if not info: break
+        ppid, name = info[0], (info[1] or "")
+        if not ppid: break
+        nl = name.lower()
+        if "claude" in nl or ("node" in nl and "claude" not in nl):
+            return ppid, name
+        pid = ppid
+    # 回退: 用当前进程的顶级非系统父进程
+    pid = os.getpid()
+    for _ in range(8):
+        info = snap.get(pid)
+        if not info: break
+        ppid, name = info[0], info[1] or ""
+        if not ppid: break
+        nl = name.lower()
+        # 跳过系统进程, 找到第一个"有意义"的父进程
+        if nl and nl not in ("cmd.exe", "bash.exe", "pwsh.exe", "powershell.exe", "conhost.exe",
+                             "svchost.exe", "winlogon.exe", "csrss.exe", "smss.exe", ""):
+            if "cmd" not in nl:  # cmd.exe 太通用, 继续向上
+                return ppid, name
+        pid = ppid
+    return os.getppid(), ""
 
 
 def _find_my_light():
-    """沿进程树向上查找, 匹配 .map-{ppid} 文件获取灯ID"""
-    pid = os.getpid()
-    for _ in range(8):
-        pid = _parent_pid(pid)
-        if not pid: break
-        mf = os.path.join(BASE, f".map-{pid}")
+    """查找当前 CC 会话的信号灯 ID"""
+    # 1. env var
+    lid = os.environ.get("CLAUDE_LIGHTS_ID", "")
+    if lid: return lid
+    # 2. 进程树锚点查找
+    anchor, _ = _find_cc_anchor()
+    if anchor:
+        mf = os.path.join(BASE, f".map-{anchor}")
         if os.path.exists(mf):
             try:
                 with open(mf) as f: return f.read().strip()
             except: pass
+        # 也检查父进程 PID (兼容旧版 .map 文件)
+        pid = os.getpid()
+        for _ in range(10):
+            snap = {p: (pp, n) for p, pp, n in _snapshot()}
+            info = snap.get(pid)
+            if not info: break
+            pid = info[0]
+            if not pid: break
+            mf = os.path.join(BASE, f".map-{pid}")
+            if os.path.exists(mf):
+                try:
+                    with open(mf) as f: return f.read().strip()
+                except: pass
     return ""
+
+
+def _lazy_start(lid_hint, status, msg):
+    """
+    懒创建信号灯: 新 CC 会话首次 hook 触发时自动创建。
+    用 CC 进程 PID 做锚点，同一会话多次 hook 调用绑定同一灯。
+    """
+    anchor, _ = _find_cc_anchor()
+    mf = os.path.join(BASE, f".map-{anchor}") if anchor else ""
+    # 检查是否已有映射 (竞态保护)
+    if mf and os.path.exists(mf):
+        try:
+            with open(mf) as f: return f.read().strip()
+        except: pass
+    # 创建新灯
+    lid = lid_hint or _next_id()
+    _write(lid, status, msg)
+    if anchor:
+        with open(mf, "w") as f: f.write(lid)
+    cmdline = [sys.executable, __file__, "server", "--id", lid]
+    if anchor: cmdline += ["--session-pid", str(anchor)]
+    proc = subprocess.Popen(cmdline, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform=="win32" else 0)
+    with open(_pidf(lid), "w") as f: f.write(str(proc.pid))
+    return lid
 
 
 def cmd_hook():
     ap = argparse.ArgumentParser(); ap.add_argument("status"); ap.add_argument("message", nargs="?", default="")
     ns, _ = ap.parse_known_args(sys.argv[2:])
-    # 优先 env var, 其次进程树查找, 最后 broadcast
+    # 1. env var (PS profile 设置)
     lid = os.environ.get("CLAUDE_LIGHTS_ID", "")
+    # 2. 进程树查找 (持久化映射)
     if not lid: lid = _find_my_light()
+    # 3. 懒创建: 新 CC 会话首次触发时自动创建灯
+    if not lid:
+        lid = _lazy_start(None, ns.status, ns.message)
+        if lid:
+            return  # 已写入初始状态, 不需要再写
     if lid: _write(lid, ns.status, ns.message)
     else: cmd_broadcast()
 
@@ -256,6 +342,13 @@ def server_main():
                 if os.path.exists(p):
                     try: os.remove(p)
                     except: pass
+            # 清理映射文件
+            for mf in glob.glob(os.path.join(BASE, ".map-*")):
+                try:
+                    with open(mf) as f:
+                        if f.read().strip() == self.lid:
+                            os.remove(mf)
+                except: pass
 
         def _read(self):
             if self._ppid and not _is_alive(self._ppid):
