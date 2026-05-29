@@ -84,9 +84,11 @@ if (Test-Path $settingsPath) {
 
     $hookDefs = @{
         PreToolUse = @{ status = "working"; message = "Working..." }
+        UserPromptSubmit = @{ status = "working"; message = "Thinking..." }
         Stop = @{ status = "success"; message = "Done" }
         StopFailure = @{ status = "error"; message = "Failed" }
         PermissionRequest = @{ status = "error"; message = "Need Choice" }
+        SessionEnd = @{ status = "shutdown"; message = "SessionEnd" }
     }
 
     foreach ($event in $hookDefs.Keys) {

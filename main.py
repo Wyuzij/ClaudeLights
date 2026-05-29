@@ -20,21 +20,37 @@ def _next_id():
 def _sf(lid): return os.path.join(BASE, f"status-{lid}.json")
 def _pidf(lid): return os.path.join(BASE, f".pid-{lid}")
 
+def _read_heartbeat(lid):
+    """读信号灯的最后心跳时间, 文件不存在或损坏返回0"""
+    sf = _sf(lid)
+    if not os.path.exists(sf): return 0
+    try:
+        with open(sf, encoding="utf-8") as f:
+            return json.load(f).get("heartbeat", 0)
+    except: return 0
+
 def _write(lid, status, msg=""):
     with open(_sf(lid), "w", encoding="utf-8") as f:
-        json.dump({"status": status, "message": msg}, f, ensure_ascii=False)
+        json.dump({"status": status, "message": msg, "heartbeat": time.time()}, f, ensure_ascii=False)
 
-def _is_alive(pid):
+def _check_alive(pid):
+    """返回 (certain, alive)。certain=False 时无法确定进程状态(如MSYS2 PID)。"""
     try:
         k32 = ctypes.windll.kernel32
         h = k32.OpenProcess(0x0400, False, pid)
         if not h:
             err = k32.GetLastError()
-            # 87=无效PID(MSYS2内部PID), 5=拒绝访问 — 均无法判断, 乐观假设存活
-            return err in (87, 5)
+            if err in (87, 5):
+                return False, True  # 不确定, 乐观假设存活
+            return True, False  # 其他错误 → 确认已死
         code = ctypes.c_ulong(); k32.GetExitCodeProcess(h, ctypes.byref(code)); k32.CloseHandle(h)
-        return code.value == 259  # STILL_ACTIVE
-    except: return True
+        alive = code.value == 259
+        return True, alive
+    except: return False, True
+
+def _is_alive(pid):
+    _, alive = _check_alive(pid)
+    return alive
 
 def cmd_start():
     ap = argparse.ArgumentParser(); ap.add_argument("--id", default=None); ap.add_argument("--session-pid", type=int, default=0)
@@ -196,6 +212,34 @@ def _find_my_light():
                 try:
                     with open(mf) as f: return f.read().strip()
                 except: pass
+    # 3. 兜底: 扫描所有活着的 server 进程, 按心跳取最新
+    # (VSCode 环境下每次 hook 调用的锚点 PID 不同, 步骤2会失败)
+    candidates = {}
+    # 从 .pid-* 文件找 (server 已启动)
+    for pidf in glob.glob(os.path.join(BASE, ".pid-*")):
+        try:
+            with open(pidf) as f: server_pid = int(f.read().strip())
+        except: continue
+        if _is_alive(server_pid):
+            lid = os.path.basename(pidf).replace(".pid-", "")
+            hb = _read_heartbeat(lid)
+            if lid not in candidates or hb > candidates[lid]:
+                candidates[lid] = hb
+    # 从 .map-* + status 文件找 (server 尚未启动完成的竞态窗口)
+    for mf in glob.glob(os.path.join(BASE, ".map-*")):
+        try:
+            with open(mf) as f: lid = f.read().strip()
+        except: continue
+        if lid in candidates: continue
+        hb = _read_heartbeat(lid)
+        if hb > 0 and time.time() - hb < 30:  # 30秒内有心跳, 说明被其他 hook 刚创建
+            candidates[lid] = hb
+    if candidates:
+        lid = max(candidates, key=candidates.get)
+        # 用当前 anchor 重写映射, 加速后续查找
+        if anchor:
+            with open(os.path.join(BASE, f".map-{anchor}"), "w") as f: f.write(lid)
+        return lid
     return ""
 
 
@@ -211,6 +255,26 @@ def _lazy_start(lid_hint, status, msg):
         try:
             with open(mf) as f: return f.read().strip()
         except: pass
+    # 兜底: 扫描活着的 server, 复用已有灯 (VSCode 锚点不稳定)
+    for pidf in glob.glob(os.path.join(BASE, ".pid-*")):
+        try:
+            with open(pidf) as f: server_pid = int(f.read().strip())
+        except: continue
+        if _is_alive(server_pid):
+            lid = os.path.basename(pidf).replace(".pid-", "")
+            if anchor:
+                with open(mf, "w") as f: f.write(lid)
+            return lid
+    # 竞态窗口: server 尚未启动完成(.pid-*未写入), 但 status 文件已有心跳
+    for mapf in glob.glob(os.path.join(BASE, ".map-*")):
+        try:
+            with open(mapf) as f: lid = f.read().strip()
+        except: continue
+        hb = _read_heartbeat(lid)
+        if hb > 0 and time.time() - hb < 30:
+            if anchor:
+                with open(mf, "w") as f: f.write(lid)
+            return lid
     # 创建新灯
     lid = lid_hint or _next_id()
     _write(lid, status, msg)
@@ -351,13 +415,22 @@ def server_main():
                 except: pass
 
         def _read(self):
-            if self._ppid and not _is_alive(self._ppid):
-                self._cleanup(); QApplication.quit(); return
+            if self._ppid:
+                certain, alive = _check_alive(self._ppid)
+                if certain and not alive:
+                    self._cleanup(); QApplication.quit(); return
             try:
                 with open(self.sf,"r",encoding="utf-8") as f: d = json.load(f)
             except: return
             s = d.get("status","idle")
             if s=="shutdown": self._cleanup(); QApplication.quit(); return
+            # 心跳兜底: 无法确认父进程状态时(如MSYS2/VSCode), 超时自清理
+            if self._ppid:
+                certain, alive = _check_alive(self._ppid)
+                if not certain:
+                    hb = d.get("heartbeat", 0)
+                    if hb and time.time() - hb > 600:
+                        self._cleanup(); QApplication.quit(); return
             if s != self.status:
                 self.status = s
                 self.age = 0.0
