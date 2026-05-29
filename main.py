@@ -1,7 +1,5 @@
 """
 ClaudeLights — 3D 玻璃质感桌宠信号灯
-统一入口: server 模式 (渲染灯) + CLI 模式 (管理)
-
 生命周期完全由 CC hooks 驱动:
 - UserPromptSubmit/PreToolUse → 首次触发懒创建灯, 后续更新状态为 working
 - Stop → success (灯亮绿色, 会话继续)
