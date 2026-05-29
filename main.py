@@ -26,9 +26,12 @@ def _sf(lid): return os.path.join(BASE, f"status-{lid}.json")
 def _pidf(lid): return os.path.join(BASE, f".pid-{lid}")
 def _mapf(ppid): return os.path.join(BASE, f".map-{ppid}")
 
-def _session_file():
-    """CC 会话标记文件: {cwd}/.claude/.claude-lights-session
-    同项目的 hooks 共享此标记, 从而绑定到同一个信号灯。"""
+def _sessionf(sid):
+    """CC 会话绑定文件: .session-{session_id} → 灯 ID"""
+    return os.path.join(BASE, f".session-{sid}")
+
+def _project_marker():
+    """项目级标记 (fallback, 同项目共享)"""
     return os.path.join(os.getcwd(), '.claude', '.claude-lights-session')
 
 def _read_heartbeat(lid):
@@ -68,9 +71,9 @@ def _is_alive(pid):
 def _find_my_light():
     """
     查找当前 CC 会话的信号灯 ID。
-    优先级: env var → 项目会话标记 (.claude/.claude-lights-session) → 心跳扫描 (兜底)
+    优先级: CLAUDE_LIGHTS_ID → CLAUDE_CODE_SESSION_ID → 项目标记 → 心跳扫描
     """
-    # 1. env var (PS profile 设置, 终端模式最可靠)
+    # 1. 手动指定 (PS profile 设置的 CLAUDE_LIGHTS_ID)
     lid = os.environ.get("CLAUDE_LIGHTS_ID", "")
     if lid and os.path.exists(_pidf(lid)):
         try:
@@ -79,27 +82,42 @@ def _find_my_light():
                     return lid
         except: pass
 
-    # 2. 项目会话标记: CC hooks 在项目目录执行, 同项目的 hooks 共享此标记
-    sf = _session_file()
-    if os.path.exists(sf):
+    # 2. CC 会话 ID 绑定 (每个 CC 窗口独立)
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if sid:
+        ssf = _sessionf(sid)
+        if os.path.exists(ssf):
+            try:
+                with open(ssf) as f: lid = f.read().strip()
+                if os.path.exists(_pidf(lid)):
+                    with open(_pidf(lid)) as f:
+                        if _is_alive(int(f.read().strip())):
+                            return lid
+            except: pass
+            # 绑定存在但灯已死 → 清理
+            try: os.remove(ssf)
+            except: pass
+        # SID 存在但无绑定 → 新 CC 会话, 不蹭别人的灯
+        return ""
+
+    # 3. 项目标记 (仅 CLI 直接调用时回退, SID 为空才会到这)
+    pm = _project_marker()
+    if os.path.exists(pm):
         try:
-            with open(sf) as f: lid = f.read().strip()
+            with open(pm) as f: lid = f.read().strip()
             if os.path.exists(_pidf(lid)):
                 with open(_pidf(lid)) as f:
                     if _is_alive(int(f.read().strip())):
                         return lid
         except: pass
-        # 标记存在但灯已死 → 清理, 后续会重建
-        try: os.remove(sf)
+        try: os.remove(pm)
         except: pass
 
-    # 有 .claude/ 目录但无会话标记 → 新项目, 不蹭别人的灯
-    cwd = os.getcwd()
-    if os.path.isdir(os.path.join(cwd, '.claude')):
+    # 有 .claude/ 但无标记 → 新项目, 不蹭别人的灯
+    if os.path.isdir(os.path.join(os.getcwd(), '.claude')):
         return ""
 
-    # 3. 心跳扫描: 仅当无 .claude/ 目录时兜底 (非 CC 项目目录)
-    #    清理残留的 .map-* 过期映射
+    # 4. 心跳扫描 (兜底: 非 CC 项目目录)
     for mp in glob.glob(os.path.join(BASE, ".map-*")):
         try:
             map_ppid = int(os.path.basename(mp).replace(".map-", ""))
@@ -124,7 +142,7 @@ def _find_my_light():
 def _lazy_start(lid_hint, status, msg):
     """
     懒创建信号灯: 新 CC 会话首次 hook 触发时自动创建。
-    在项目 .claude/ 目录写会话标记, 后续 hooks 通过标记找到所属灯。
+    用 CLAUDE_CODE_SESSION_ID 绑定 → 每个 CC 窗口独立信号灯。
     """
     lid = lid_hint or _next_id()
     _write(lid, status, msg)
@@ -132,11 +150,15 @@ def _lazy_start(lid_hint, status, msg):
     proc = subprocess.Popen(cmdline, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform=="win32" else 0)
     with open(_pidf(lid), "w") as f: f.write(str(proc.pid))
-    # 写项目会话标记: 项目目录 → 灯 ID
+    # ① CC 会话 ID 绑定 (每个窗口独立)
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if sid:
+        with open(_sessionf(sid), "w") as f: f.write(lid)
+    # ② 项目级标记 (兼容旧版, 同项目回退)
     try:
-        sf = _session_file()
-        os.makedirs(os.path.dirname(sf), exist_ok=True)
-        with open(sf, "w") as f: f.write(lid)
+        pm = _project_marker()
+        os.makedirs(os.path.dirname(pm), exist_ok=True)
+        with open(pm, "w") as f: f.write(lid)
     except: pass
     return lid
 
@@ -168,14 +190,21 @@ def cmd_stop():
         if os.path.exists(p):
             try: os.remove(p)
             except: pass
-    # 清理指向本灯的会话标记
-    for path in [os.path.join(os.getcwd(), '.claude', '.claude-lights-session')]:
+    # 清理指向本灯的会话绑定
+    for sf in glob.glob(os.path.join(BASE, ".session-*")):
         try:
-            if os.path.exists(path):
-                with open(path) as f:
-                    if f.read().strip() == ns.id:
-                        os.remove(path)
+            with open(sf) as f:
+                if f.read().strip() == ns.id:
+                    os.remove(sf)
         except: pass
+    # 清理项目标记
+    pm = os.path.join(os.getcwd(), '.claude', '.claude-lights-session')
+    try:
+        if os.path.exists(pm):
+            with open(pm) as f:
+                if f.read().strip() == ns.id:
+                    os.remove(pm)
+    except: pass
     # 清理旧版 .map-* 残留
     for mf in glob.glob(os.path.join(BASE, ".map-*")):
         try:
@@ -350,14 +379,21 @@ def server_main():
                 if os.path.exists(p):
                     try: os.remove(p)
                     except: pass
-            # 清理指向本灯的会话标记
-            for path in [os.path.join(os.getcwd(), '.claude', '.claude-lights-session')]:
+            # 清理指向本灯的 .session-* 绑定
+            for sf in glob.glob(os.path.join(BASE, ".session-*")):
                 try:
-                    if os.path.exists(path):
-                        with open(path) as f:
-                            if f.read().strip() == self.lid:
-                                os.remove(path)
+                    with open(sf) as f:
+                        if f.read().strip() == self.lid:
+                            os.remove(sf)
                 except: pass
+            # 清理项目标记
+            pm = os.path.join(os.getcwd(), '.claude', '.claude-lights-session')
+            try:
+                if os.path.exists(pm):
+                    with open(pm) as f:
+                        if f.read().strip() == self.lid:
+                            os.remove(pm)
+            except: pass
             # 清理旧版 .map-* 残留
             for mf in glob.glob(os.path.join(BASE, ".map-*")):
                 try:
