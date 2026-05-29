@@ -321,14 +321,14 @@ def server_main():
 
     WW, WH = 54, 152
     POLL_MS = 350
-    WINDOW_OPACITY = 0.78
+    WINDOW_OPACITY = 0.92
     SOCKET = QColor(0x10, 0x10, 0x16)
-    OFF = [QColor(0x30,0x15,0x18), QColor(0x24,0x20,0x12), QColor(0x10,0x1E,0x15)]
-    ON  = [QColor(0xFF,0x28,0x28), QColor(0xFF,0xCA,0x00), QColor(0x20,0xFF,0x46)]
+    OFF = [QColor(0x40,0x1A,0x1E), QColor(0x30,0x2A,0x16), QColor(0x14,0x28,0x1A)]
+    ON  = [QColor(0xFF,0x30,0x30), QColor(0xFF,0xD4,0x10), QColor(0x28,0xFF,0x50)]
     LIGHT_Y = [47, 83, 119]
     LIGHT_R = 13.5
-    PULSE = {"idle":(0.010,0.06,0.18), "working":(0.045,0.26,0.36),
-             "success":(0.06,0.42,0.48), "error":(0.08,0.40,0.40)}
+    PULSE = {"idle":(0.010,0.08,0.22), "working":(0.045,0.28,0.40),
+             "success":(0.06,0.44,0.52), "error":(0.08,0.42,0.44)}
 
     ap = argparse.ArgumentParser()
     ap.add_argument("server", nargs="?"); ap.add_argument("--id", required=True)
@@ -358,6 +358,15 @@ def server_main():
             self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             self.setStyleSheet("background: transparent;")
             self.setWindowOpacity(WINDOW_OPACITY)
+            # Windows API: WS_EX_TRANSPARENT 比 Qt 属性更可靠
+            if sys.platform == "win32":
+                hwnd = int(self.winId())
+                GWL_EXSTYLE = -20
+                WS_EX_TRANSPARENT = 0x00000020
+                WS_EX_LAYERED = 0x00080000
+                user32 = ctypes.windll.user32
+                ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT | WS_EX_LAYERED)
 
             try: n = int(lid.split("-")[-1])
             except: n = 1
@@ -498,7 +507,7 @@ def server_main():
                 p.setBrush(sg); p.drawEllipse(QPointF(cx, cy), sr-0.5, sr-0.5)
 
                 cur = self.cur[i]
-                for gr, ab in [(LIGHT_R+15,0.012),(LIGHT_R+12,0.022),(LIGHT_R+9,0.036),(LIGHT_R+6,0.055),(LIGHT_R+3.5,0.080),(LIGHT_R+1.2,0.115)]:
+                for gr, ab in [(LIGHT_R+15,0.020),(LIGHT_R+12,0.035),(LIGHT_R+9,0.055),(LIGHT_R+6,0.080),(LIGHT_R+3.5,0.110),(LIGHT_R+1.2,0.150)]:
                     a = int(ab * glow * 255)
                     p.setBrush(QColor(cur.red(), cur.green(), cur.blue(), a))
                     p.drawEllipse(QPointF(cx, cy), gr, gr)
@@ -513,12 +522,12 @@ def server_main():
                 bulb.setColorAt(1.00, QColor(max(0,cur.red()-75), max(0,cur.green()-75), max(0,cur.blue()-75)))
                 p.setBrush(bulb); p.drawEllipse(QPointF(cx, cy), LIGHT_R, LIGHT_R)
 
-                p.setBrush(QColor(255,255,255,38))
+                p.setBrush(QColor(255,255,255,55))
                 p.drawEllipse(QPointF(cx-4.5, cy-6), 3.5, 2.0)
-                p.setBrush(QColor(255,255,255,18))
+                p.setBrush(QColor(255,255,255,28))
                 p.drawEllipse(QPointF(cx-3.5, cy-5), 2.2, 1.2)
                 if glow > 0.15:
-                    p.setBrush(QColor(255,255,255, int(glow*14)))
+                    p.setBrush(QColor(255,255,255, int(glow*22)))
                     p.drawEllipse(QPointF(cx+2.5, cy+6), 4.2, 1.8)
 
             p.setPen(QColor(0xA8,0xA8,0xB8))
