@@ -8,11 +8,32 @@ ClaudeLights — 3D 玻璃质感桌宠信号灯
 - 心跳 30s 超时 → 异常退出兜底 (hook 进程被 kill 前来不及写 shutdown)
 """
 import json, os, sys, time, math, glob, subprocess, socket, ctypes, argparse, threading
+import pygame
 
 # ============================================================
 # CLI 模式
 # ============================================================
 BASE = os.path.dirname(os.path.abspath(__file__))
+SOUNDS_DIR = os.path.join(BASE, "sounds")
+COMPLETE_SOUND = os.path.join(SOUNDS_DIR, "dragon-studio-new-notification-3-398649.mp3")
+
+def _ensure_sound():
+    """确保提示音文件存在"""
+    return os.path.exists(COMPLETE_SOUND)
+
+def _play_complete_sound(wait=True):
+    """播放任务完成提示音 (pygame.mixer 支持 MP3/WAV). wait=True 会阻塞到播放结束, 用于短生命周期进程."""
+    if not _ensure_sound():
+        return
+    try:
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+        sound = pygame.mixer.Sound(COMPLETE_SOUND)
+        sound.play()
+        if wait:
+            time.sleep(sound.get_length() + 0.1)
+    except Exception:
+        pass
 
 def _next_id():
     existing = set()
@@ -219,6 +240,8 @@ def cmd_set():
     ns, _ = ap.parse_known_args(sys.argv[2:])
     _write(ns.id, ns.status, ns.message)
     print(f"  {ns.id} -> {ns.status} {ns.message}")
+    if ns.status == "success":
+        _play_complete_sound()
 
 def cmd_list():
     files = glob.glob(os.path.join(BASE, "status-*.json"))
@@ -267,6 +290,9 @@ def cmd_hook():
             return  # _lazy_start 已写入初始状态
     if lid: _write(lid, ns.status, ns.message)
     else: cmd_broadcast()
+    # 任务完成时播放提示音
+    if ns.status == "success":
+        _play_complete_sound()
 
 def cmd_shutdown():
     for f in glob.glob(os.path.join(BASE, "status-*.json")):
@@ -422,6 +448,9 @@ def server_main():
                 self.age = 0.0
                 p = PULSE.get(s, PULSE["idle"])
                 self._tspd, self._tamp, self._tbase = p
+                # 转换到 success 时播放提示音 (server 长生命周期, 异步播放不阻塞 UI)
+                if s == "success":
+                    _play_complete_sound(wait=False)
 
         def paintEvent(self, e):
             p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
