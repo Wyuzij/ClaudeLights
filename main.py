@@ -46,6 +46,39 @@ def _next_id():
 def _sf(lid): return os.path.join(BASE, f"status-{lid}.json")
 def _pidf(lid): return os.path.join(BASE, f".pid-{lid}")
 def _mapf(ppid): return os.path.join(BASE, f".map-{ppid}")
+def _lock_path(): return os.path.join(BASE, ".lock")
+
+def _acquire_lock(timeout=5.0):
+    """文件锁, 防止并发 hook 同时创建信号灯。带死锁检测。"""
+    lp = _lock_path()
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fd = os.open(lp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            with open(lp, "w") as f:
+                json.dump({"pid": os.getpid(), "ts": time.time()}, f)
+            return True
+        except FileExistsError:
+            # 死锁检测: 锁文件超过 10s → 强行清理
+            try:
+                with open(lp) as f:
+                    info = json.load(f)
+                if time.time() - info.get("ts", 0) > 10:
+                    try: os.remove(lp)
+                    except: pass
+                    continue
+            except: pass
+            if time.time() > deadline:
+                return False
+            time.sleep(0.1)
+
+def _release_lock():
+    try:
+        lp = _lock_path()
+        if os.path.exists(lp):
+            os.remove(lp)
+    except: pass
 
 def _sessionf(sid):
     """CC 会话绑定文件: .session-{session_id} → 灯 ID"""
@@ -93,6 +126,7 @@ def _find_my_light():
     """
     查找当前 CC 会话的信号灯 ID。
     优先级: CLAUDE_LIGHTS_ID → CLAUDE_CODE_SESSION_ID → 项目标记 → 心跳扫描
+    带重试机制, 防止并发 hook 同时创建灯 (竞态)。
     """
     # 1. 手动指定 (PS profile 设置的 CLAUDE_LIGHTS_ID)
     lid = os.environ.get("CLAUDE_LIGHTS_ID", "")
@@ -107,17 +141,42 @@ def _find_my_light():
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if sid:
         ssf = _sessionf(sid)
-        if os.path.exists(ssf):
-            try:
-                with open(ssf) as f: lid = f.read().strip()
-                if os.path.exists(_pidf(lid)):
-                    with open(_pidf(lid)) as f:
-                        if _is_alive(int(f.read().strip())):
+        # 轮询等待: 另一个并发 hook 可能正在创建 → 等它写完 .pid
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if os.path.exists(ssf):
+                try:
+                    with open(ssf) as f: lid = f.read().strip()
+                    pidf = _pidf(lid)
+                    if os.path.exists(pidf):
+                        with open(pidf) as f:
+                            pid = int(f.read().strip())
+                        if _is_alive(pid):
                             return lid
-            except: pass
-            # 绑定存在但灯已死 → 清理
-            try: os.remove(ssf)
-            except: pass
+                        # 灯已死 → 清理绑定 (加锁防止惊群)
+                        if _acquire_lock(2.0):
+                            try:
+                                if os.path.exists(ssf):
+                                    os.remove(ssf)
+                                # 删除死灯的 pidf, 让 _next_id 重新分配
+                                dead_pidf = _pidf(lid)
+                                if os.path.exists(dead_pidf):
+                                    try: os.remove(dead_pidf)
+                                    except: pass
+                                dead_sf = _sf(lid)
+                                if os.path.exists(dead_sf):
+                                    try: os.remove(dead_sf)
+                                    except: pass
+                            finally:
+                                _release_lock()
+                        break
+                    # .session 存在但 .pid 还不存在 → 另一个 hook 正在创建, 等待
+                except:
+                    # 文件损坏/不可读 → 等待后清理
+                    if time.time() > deadline - 0.5:
+                        try: os.remove(ssf)
+                        except: pass
+            time.sleep(0.15)
         # SID 存在但无绑定 → 新 CC 会话, 不蹭别人的灯
         return ""
 
@@ -164,24 +223,42 @@ def _lazy_start(lid_hint, status, msg):
     """
     懒创建信号灯: 新 CC 会话首次 hook 触发时自动创建。
     用 CLAUDE_CODE_SESSION_ID 绑定 → 每个 CC 窗口独立信号灯。
+    加文件锁防止并发 hook 同时创建。
+    **先写 .session 绑定, 再创建灯** — 让并发 hook 第一时间发现已有绑定。
     """
-    lid = lid_hint or _next_id()
-    _write(lid, status, msg)
-    cmdline = [sys.executable, __file__, "server", "--id", lid]
-    proc = subprocess.Popen(cmdline, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform=="win32" else 0)
-    with open(_pidf(lid), "w") as f: f.write(str(proc.pid))
-    # ① CC 会话 ID 绑定 (每个窗口独立)
-    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    if sid:
-        with open(_sessionf(sid), "w") as f: f.write(lid)
-    # ② 项目级标记 (兼容旧版, 同项目回退)
+    if not _acquire_lock(5.0):
+        return ""  # 获取锁超时, 不可能
+
     try:
-        pm = _project_marker()
-        os.makedirs(os.path.dirname(pm), exist_ok=True)
-        with open(pm, "w") as f: f.write(lid)
-    except: pass
-    return lid
+        # 二次检查: 锁获得后, 另一个 hook 可能已创建
+        sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        ssf = _sessionf(sid) if sid else ""
+        if ssf and os.path.exists(ssf):
+            try:
+                with open(ssf) as f: return f.read().strip()
+            except: pass
+
+        lid = lid_hint or _next_id()
+        # ① 先写 CC 会话 ID 绑定 — 让并发 hook 第一时间发现此灯
+        if sid:
+            with open(ssf, "w") as f: f.write(lid)
+        # ② 项目级标记
+        try:
+            pm = _project_marker()
+            os.makedirs(os.path.dirname(pm), exist_ok=True)
+            with open(pm, "w") as f: f.write(lid)
+        except: pass
+        # ③ 写初始状态
+        _write(lid, status, msg)
+        # ④ 启动灯进程
+        cmdline = [sys.executable, __file__, "server", "--id", lid]
+        proc = subprocess.Popen(cmdline, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform=="win32" else 0)
+        # ⑤ 写 PID (在进程启动后)
+        with open(_pidf(lid), "w") as f: f.write(str(proc.pid))
+        return lid
+    finally:
+        _release_lock()
 
 def cmd_start():
     ap = argparse.ArgumentParser(); ap.add_argument("--id", default=None)

@@ -46,19 +46,19 @@ if (-not $claudePath) { $claudePath = "claude" }
 
 $func = @"
 
-# ClaudeLights auto-start
+# ClaudeLights auto-start — cmd /c 绕开 function 覆盖, 避免递归
 function claude {
     `$LIGHTS_DIR = "$InstallDir"
     `$id = `$null
     try {
-        `$output = & $BIN start --session-pid `$PID 2>&1
+        `$output = & $BIN start 2>&1
         `$id = (`$output | Select-String -Pattern "CC-\d+").Matches.Value
         if (`$id) {
             `$env:CLAUDE_LIGHTS_ID = `$id
             `$env:CLAUDE_LIGHTS_DIR = `$LIGHTS_DIR
             Write-Host "[ClaudeLights] `$id ready"
         }
-        & "$claudePath" @args
+        cmd /c "claude `$args"
     } finally {
         if (`$id) { & $BIN stop `$id 2>`$null }
     }
