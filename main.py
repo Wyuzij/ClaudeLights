@@ -231,12 +231,28 @@ def _lazy_start(lid_hint, status, msg):
 
     try:
         # 二次检查: 锁获得后, 另一个 hook 可能已创建
+        # 必须验证灯进程存活 — .session 可能是残留的死绑定
         sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
         ssf = _sessionf(sid) if sid else ""
         if ssf and os.path.exists(ssf):
             try:
-                with open(ssf) as f: return f.read().strip()
-            except: pass
+                with open(ssf) as f: existing = f.read().strip()
+                pidf = _pidf(existing)
+                if os.path.exists(pidf):
+                    with open(pidf) as f:
+                        if _is_alive(int(f.read().strip())):
+                            return existing
+                # 死灯 → 清理僵尸绑定, 重新创建
+                try: os.remove(ssf)
+                except: pass
+                try: os.remove(pidf)
+                except: pass
+                try: os.remove(_sf(existing))
+                except: pass
+            except Exception:
+                # 文件损坏 → 清理
+                try: os.remove(ssf)
+                except: pass
 
         lid = lid_hint or _next_id()
         # ① 先写 CC 会话 ID 绑定 — 让并发 hook 第一时间发现此灯
