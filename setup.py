@@ -2914,13 +2914,11 @@ class SetupApp(tk.Tk):
     def _launch_client(self):
         """Launch the management client after successful install."""
         # Verify PySide6 is actually importable before attempting launch
-        try:
-            subprocess.run(
-                [sys.executable, "-c", "import PySide6"],
-                capture_output=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-            )
-        except Exception:
+        r = subprocess.run(
+            [sys.executable, "-c", "import PySide6"],
+            capture_output=True, timeout=10,
+        )
+        if r.returncode != 0:
             self._append_log("\n✗ PySide6 未正确安装, 无法启动管理客户端")
             self._append_log("  请手动运行: pip install PySide6 pygame")
             self._append_log("  然后运行: python ~/.claude-lights/client.pyw")
