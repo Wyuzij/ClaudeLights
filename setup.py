@@ -2375,7 +2375,6 @@ function claude {{
             "Stop":              ("success",  "Done"),
             "StopFailure":       ("error",    "Failed"),
             "PermissionRequest": ("error",    "Need Choice"),
-            "SessionEnd":        ("shutdown", "SessionEnd"),
         }
 
         settings = {}
@@ -2414,6 +2413,32 @@ function claude {{
                     "async": True,
                     "asyncRewake": False,
                 })
+
+        # SessionEnd — synchronous (not async), using direct `shutdown` command
+        # so the shutdown signal is guaranteed to write before Claude Code exits.
+        if self._cancelled:
+            return
+        ses_cmd = f'{bin_cmd} shutdown'
+        ses_event = "SessionEnd"
+        if ses_event not in settings["hooks"]:
+            settings["hooks"][ses_event] = []
+        ses_found = False
+        for group in settings["hooks"].get(ses_event, []):
+            for h in group.get("hooks", []):
+                if "claude-lights" in h.get("command", "").lower():
+                    h["command"] = ses_cmd
+                    h.pop("async", None)
+                    h.pop("asyncRewake", None)
+                    h["timeout"] = 5
+                    ses_found = True
+        if not ses_found:
+            if len(settings["hooks"].get(ses_event, [])) == 0:
+                settings["hooks"][ses_event] = [{"matcher": "", "hooks": []}]
+            settings["hooks"][ses_event][0]["hooks"].append({
+                "type": "command",
+                "command": ses_cmd,
+                "timeout": 5,
+            })
 
         os.makedirs(os.path.dirname(settings_path), exist_ok=True)
         with open(settings_path, "w", encoding="utf-8") as f:

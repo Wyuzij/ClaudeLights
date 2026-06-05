@@ -85,10 +85,10 @@ PreToolUse        →  python main.py hook working   "Working..."
 Stop              →  python main.py hook success   "Done"
 StopFailure       →  python main.py hook error     "Failed"
 PermissionRequest →  python main.py hook error     "Need Choice"
-SessionEnd        →  python main.py hook shutdown  "SessionEnd"
+SessionEnd        →  python main.py shutdown        (同步, 不异步)
 ```
 
-所有 hook 都是 `"async": true` — 发完即返回，不阻塞 Claude。
+SessionEnd 是唯一**同步钩子**——必须等 `shutdown` 命令写完信号灯才能退出 Claude Code，这样灯不会残留。
 
 ### ③ 信号灯进程（PySide6）→ 文件轮询
 

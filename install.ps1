@@ -106,7 +106,6 @@ if (Test-Path $settingsPath) {
         Stop = @{ status = "success"; message = "Done" }
         StopFailure = @{ status = "error"; message = "Failed" }
         PermissionRequest = @{ status = "error"; message = "Need Choice" }
-        SessionEnd = @{ status = "shutdown"; message = "SessionEnd" }
     }
 
     foreach ($evt in $hookDefs.Keys) {
@@ -137,6 +136,36 @@ if (Test-Path $settingsPath) {
                 async = $true
                 asyncRewake = $false
             }
+        }
+    }
+
+    # SessionEnd — must be synchronous (not async), using direct `shutdown` command
+    # so the shutdown signal is guaranteed to write before Claude Code exits.
+    $evt = "SessionEnd"
+    $cmd = "$BIN shutdown"
+    if (-not $settings.hooks.$evt) {
+        $settings.hooks | Add-Member -NotePropertyName $evt -NotePropertyValue @() -Force
+    }
+    $found = $false
+    foreach ($group in $settings.hooks.$evt) {
+        foreach ($h in $group.hooks) {
+            if ($h.command -match "lights\.py|claude-lights") {
+                $h.command = $cmd
+                $h.Remove('async')
+                $h.Remove('asyncRewake')
+                $h.timeout = 5
+                $found = $true
+            }
+        }
+    }
+    if (-not $found) {
+        if ($settings.hooks.$evt.Count -eq 0) {
+            $settings.hooks.$evt = @(@{ matcher = ""; hooks = @() })
+        }
+        $settings.hooks.$evt[0].hooks += @{
+            type = "command"
+            command = $cmd
+            timeout = 5
         }
     }
 
