@@ -2608,12 +2608,6 @@ class SetupApp(tk.Tk):
                                      command=self.destroy, state="disabled")
         self._close_btn.pack(side="left")
 
-        self._launch_btn = tk.Button(btn_frame, text="启动管理客户端 →", font=("Segoe UI", 9, "bold"),
-                                      fg="#1A1A1A", bg=C["accent"],
-                                      relief="flat", padx=16, pady=4, cursor="hand2",
-                                      command=self._launch_client, state="disabled")
-        self._launch_btn.pack(side="right")
-
         self.update()
         self._run_install_thread()
 
@@ -2649,11 +2643,7 @@ class SetupApp(tk.Tk):
         if success:
             self._step_label.configure(text="✅ 安装完成！", fg=C["green"])
             self._close_btn.configure(state="normal")
-            self._launch_btn.configure(state="normal", text="🚀 启动管理客户端 →")
-            self._append_log("\n🎉 安装成功！点击下方按钮启动管理客户端。")
-            self._append_log("新开 PowerShell 窗口，输入 claude 即可体验信号灯。")
-            # Flash the launch button
-            self._flash_launch()
+            self._append_log("\n🎉 安装成功！新开 PowerShell 窗口，输入 claude 即可体验信号灯。")
         else:
             self._step_label.configure(text="⚠ 安装遇到问题", fg=C["red"])
             self._close_btn.configure(state="normal")
@@ -2662,45 +2652,7 @@ class SetupApp(tk.Tk):
                 self._append_log(f"  - {e}")
             self._append_log("\n请检查网络连接和 Python 环境后重试。")
 
-    def _flash_launch(self):
-        def toggle():
-            if not hasattr(self, "_launch_btn") or not self._launch_btn.winfo_exists():
-                return
-            current = self._launch_btn.cget("bg")
-            self._launch_btn.configure(bg=C["white"] if current == C["accent"] else C["accent"])
-            self.after(400, toggle)
-        self.after(200, toggle)
-
-    def _launch_client(self):
-        """Launch the management client after successful install."""
-        # Verify PySide6 is actually importable before attempting launch
-        r = subprocess.run(
-            [sys.executable, "-c", "import PySide6"],
-            capture_output=True, timeout=10,
-        )
-        if r.returncode != 0:
-            self._append_log("\n✗ PySide6 未正确安装, 无法启动管理客户端")
-            self._append_log("  请手动运行: pip install PySide6 pygame")
-            self._append_log("  然后运行: python ~/.claude-lights/client.pyw")
-            return
-
-        client_py = os.path.join(INSTALL_DIR, "client.pyw")
-        if not os.path.exists(client_py):
-            client_py = os.path.join(INSTALL_DIR, "client.py")
-        if os.path.exists(client_py):
-            try:
-                subprocess.Popen(
-                    [sys.executable, client_py],
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-                )
-                self._append_log("\n✓ 管理客户端已启动（查看系统托盘）")
-            except Exception as e:
-                self._append_log(f"\n✗ 启动客户端失败: {e}")
-                self._append_log(f"  请手动运行: python {client_py}")
-        else:
-            self._append_log("\n✗ 未找到客户端文件，请检查安装目录")
-
-        self.after(1000, self.destroy)
+    # (管理客户端已独立运行: python ~/.claude-lights/client.pyw)
 
 
 # ============================================================
