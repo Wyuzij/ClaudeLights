@@ -1407,7 +1407,7 @@ class MainWindow:
             no_lights.setEnabled(False)
 
         # Update tray icon color
-        from PySide6.QtGui import QPixmap, QPainter, QColor
+        from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor
         if any(l.status == "error" for l in alive):
             color = COLORS["red"]
         elif any(l.status == "working" for l in alive):
