@@ -1,159 +1,147 @@
 # ClaudeLights
 
-Claude Code 桌面信号灯 — 3D 玻璃质感悬浮窗，实时显示 AI 任务状态。
+Claude Code 桌面信号灯。3D 玻璃质感悬浮窗，AI 状态一目了然。
 
-![Python](https://img.shields.io/badge/python-3.8+-blue)
-![Platform](https://img.shields.io/badge/platform-Windows%2011-lightgrey)
-![License](https://img.shields.io/badge/license-MIT-green)
-
-- 真透明置顶悬浮，鼠标穿透不挡操作
-- CC hooks 首次触发懒创建，SessionEnd 自动关闭
-- 纯 hooks 驱动，无进程树依赖（VSCode + Terminal 均可靠）
-- 会话级隔离：`CLAUDE_CODE_SESSION_ID` 绑定，多窗口各自独立信号灯
-- 任务完成提示音：pygame.mixer 播放 MP3/WAV，Server 异步不阻塞 UI
-- 11 层荧光光晕 + 8 段球体渐变 + 玻璃曲面高光
-- 心跳超时兜底 (30s)，异常退出自动清理
+[![Python](https://img.shields.io/badge/python-3.8+-blue)](https://python.org)
+[![Platform](https://img.shields.io/badge/platform-Windows%2011-lightgrey)]()
+[![License](https://img.shields.io/badge/license-MIT-green)]()
 
 ---
 
-## 一键安装
+## 效果速览
 
-要求 Python 3.8+，PowerShell 中执行：
+屏幕左上角出现一个半透明悬浮窗，三盏灯实时反映 Claude Code 的状态：
+
+| 灯光 | 触发条件 |
+|---|---|
+| 🟢 **绿色呼吸** | 就绪，等待输入 |
+| 🟡 **黄色脉冲** | AI 思考/工作中（`UserPromptSubmit` / `PreToolUse`） |
+| 🟢 **绿色爆闪** + 🔊 | 任务完成（`Stop`），同步播放提示音 |
+| 🔴 **红色脉冲** | 异常或需要用户选择（`StopFailure` / `PermissionRequest`） |
+
+灯窗口**鼠标完全穿透** — 点击只会落在它下方的窗口上，不影响任何操作。
+
+---
+
+## 安装（下载 → 双击 → 完成）
+
+**前提：** 电脑装有 Python 3.8+（[python.org](https://python.org) 下载）
+
+1. **下载** [`ClaudeLights-Setup.exe`](https://github.com/Wyuzij/ClaudeLights/releases/latest/download/ClaudeLights-Setup.exe)
+
+2. **双击打开** → 暗色主题安装向导启动
+
+3. **点击"⚡ 一键安装"** → 全自动完成五项配置（见下文）
+
+4. **新开 PowerShell，输入 `claude`** → 信号灯自动出现
+
+> 不需要手动 `pip install` 任何东西 — setup.exe 自动安装 PySide6 + pygame。
+
+---
+
+## 安装后多了什么
+
+安装程序只改三个地方：
+
+| 位置 | 做了什么 |
+|---|---|
+| `~/.claude-lights/` | 复制 core.py、light_server.py、main.py、client.py、声音文件 |
+| `~/.claude/settings.json` | 写入 6 个 hook 命令（Claude Code 生命周期钩子） |
+| PowerShell profile | 注入 `claude` 包装函数（拦截命令，自动启停信号灯） |
+
+**卸载同理**：客户端里输入 `DELETE` 确认，三个地方原样清理。
+
+---
+
+## 它是怎么工作的
+
+布局很简单：**两层拦截 + 一层文件通信**。
+
+### ① PowerShell profile → 拦下 `claude` 命令
+
+每次你敲 `claude`，先启动信号灯进程，再启动真正的 Claude Code，退出时自动关灯：
 
 ```powershell
-# 1. 安装依赖
-pip install PySide6 pygame
+function claude {
+    # 1. 启动信号灯
+    $id = (python ~/.claude-lights/main.py start | sls "CC-\d+").Matches.Value
+    $env:CLAUDE_LIGHTS_ID = $id
 
-# 2. 运行安装脚本
-powershell -ExecutionPolicy Bypass -File install.ps1
+    # 2. 启动真正的 claude
+    cmd /c "claude $args"
+
+    # 3. 退出后关灯
+    python ~/.claude-lights/main.py stop $id
+}
 ```
 
-`install.ps1` 自动完成：
-- 复制 `main.py` 到 `~/.claude-lights/`
-- 创建 `sounds/` 目录（提示音文件需手动放入）
-- 配置 PowerShell profile（拦截 `claude` 命令自动启停信号灯）
-- 配置 Claude Code hooks（6 个生命周期事件全覆盖）
+### ② Claude Code hooks → 监听 6 个生命周期事件
 
-之后新开 PowerShell 窗口，直接敲 `claude` 就能看到左上角的信号灯。
+`~/.claude/settings.json` 里注入的 hook 命令。每当 CC 内部状态变化，自动执行一行 Python：
+
+```
+UserPromptSubmit  →  python main.py hook working   "Thinking..."
+PreToolUse        →  python main.py hook working   "Working..."
+Stop              →  python main.py hook success   "Done"
+StopFailure       →  python main.py hook error     "Failed"
+PermissionRequest →  python main.py hook error     "Need Choice"
+SessionEnd        →  python main.py hook shutdown  "SessionEnd"
+```
+
+所有 hook 都是 `"async": true` — 发完即返回，不阻塞 Claude。
+
+### ③ 信号灯进程（PySide6）→ 文件轮询
+
+Hook 写 JSON → 信号灯 350ms 读一次 → 看到变化就切动画：
+
+```
+status-CC-1.json 写入 "working"   →  信号灯读到 → 黄灯脉冲
+status-CC-1.json 写入 "success"   →  信号灯读到 → 绿灯爆闪 + 播 MP3
+status-CC-1.json 写入 "shutdown"  →  信号灯读到 → 清理退出
+```
+
+**全程用文件系统通信**，没有管道、没有网络、不读进程树。这就是为什么无论 Claude Code 跑在独立终端、VSCode 集成终端、还是 VSCode Agent 面板，信号灯都正常工作。
+
+### 支持 VSCode Claude 插件
+
+在 VSCode 中通过 Claude Code 插件使用时，信号灯同样正常运作。CC 自动设置 `CLAUDE_CODE_SESSION_ID` 环境变量，hook 据此查找或懒创建对应信号灯，每个 VSCode 窗口的 CC 会话各自独立。
 
 ---
 
-## 手动使用
+## 多窗口
+
+一个 VSCode 窗口跑 Claude，一个 Terminal 也跑 Claude → 两个独立的信号灯，自动排成纵向一列。每列 8 个，超出换列。
+
+---
+
+## GUI 管理客户端
+
+双击 `~/.claude-lights/client.pyw` 或从安装向导启动。系统托盘常驻，双击托盘图标打开仪表盘：
+
+- **仪表盘**：实时状态、启停控制、统计
+- **系统托盘**：灯泡颜色 = 当前状态（绿/黄/红/灰）
+- **设置**：换提示音、开关单个 hook、开机自启
+- **卸载**：输入 DELETE 全清
+
+---
+
+## 手动命令
 
 ```powershell
-# 启动
-python main.py start                    # 自动编号 CC-1
-python main.py start --id MyProject     # 自定义 ID
-
-# 查看状态
-python main.py list
-
-# 手动更新
-python main.py set CC-1 working "Building..."
-python main.py set CC-1 success "Done"
-python main.py set CC-1 error   "Need input"
-
-# 停止
-python main.py stop CC-1
-python main.py shutdown                 # 全部停止
+python main.py start          # 启动
+python main.py list           # 查看所有灯
+python main.py set CC-1 idle  # 改状态
+python main.py stop CC-1      # 停止一个
+python main.py shutdown       # 全部停止
 ```
 
 ---
 
-## 状态说明
+## 构建
 
-- **绿灯呼吸** — 就绪 (idle)，默认状态
-- **黄灯脉冲** — 运行中 (working)，UserPromptSubmit / PreToolUse 触发
-- **绿灯爆闪** — 完成 (success)，Stop 触发，同步播放提示音
-- **红灯脉冲** — 异常/需选择 (error)，StopFailure / PermissionRequest 触发
-
----
-
-## 提示音
-
-任务完成时自动播放提示音。默认音效文件：`sounds/dragon-studio-new-notification-3-398649.mp3`
-
-- 支持 MP3、WAV 格式（pygame.mixer）
-- 替换音效：将任意 MP3/WAV 放入 `sounds/` 目录，修改 `main.py` 第 18 行 `COMPLETE_SOUND` 路径
-- Server 模式异步播放不阻塞 UI 动画
-- Hook/CLI 模式等待播放完成后进程退出，避免截断
-
----
-
-## 生命周期（纯 CC hooks 驱动）
-
-```
-新 CC 会话 → 首次 hook (UserPromptSubmit / PreToolUse)
-  → 懒创建信号灯进程 + 写入 CLAUDE_CODE_SESSION_ID 绑定
-  → 后续 hook 自动找到所属灯，更新状态
-
-会话进行中:
-  PreToolUse / UserPromptSubmit → 黄灯 working
-  Stop                         → 绿灯 success + 播放提示音
-  StopFailure / PermissionReq  → 红灯 error
-  心跳持续刷新（每个 hook 写入 heartbeat）
-
-会话结束:
-  SessionEnd hook  → 写入 shutdown → 灯进程立即退出
-  异常退出         → 心跳 30s 超时 → 兜底清理
-```
-
----
-
-## 多窗口隔离
-
-每个 CC 会话（VSCode 窗口 / Terminal 标签页）拥有独立信号灯：
-
-- **主机制**：`CLAUDE_CODE_SESSION_ID` 环境变量 → `.session-{sid}` 绑定文件
-- **回退**：项目标记 `.claude/.claude-lights-session`（同项目共享）
-- **兜底**：心跳扫描 + 存活检查（跳过已被认领的灯）
-
-多灯自动网格排列：每列 8 个，超出自动换列。
-
----
-
-## 工作原理
-
-```
-hooks 驱动 (VSCode + Terminal 通用):
-
-  CC hooks 事件 → main.py hook <status> <message>
-    → 查找所属灯 (三级优先级):
-      ① CLAUDE_LIGHTS_ID 环境变量 (PS profile 设置)
-      ② CLAUDE_CODE_SESSION_ID 会话绑定 (区分不同 CC 会话)
-      ③ 项目标记 + 心跳扫描 (兼容回退)
-    → 首次触发时懒创建新灯 + 写入会话绑定
-    → 写入 status-{id}.json (含 heartbeat 时间戳)
-
-信号灯进程 (PySide6 渲染):
-
-  30ms 动画循环 — 颜色渐变插值 + 正弦脉冲光晕
-  350ms 轮询 status-{id}.json:
-    → shutdown     → 立即退出 + 清理绑定文件
-    → heartbeat > 30s → 兜底退出（会话异常）
-    → 状态变更     → 切换灯色 + 重置动画相位
-    → success      → pygame.mixer 异步播放提示音
-```
-
----
-
-## 依赖
-
-- Python 3.8+
-- [PySide6](https://pypi.org/project/PySide6/) — Qt for Python (窗口渲染)
-- [pygame](https://pypi.org/project/pygame/) — SDL2 mixer (提示音播放)
-
----
-
-## 项目结构
-
-```
-ClaudeLights/
-  main.py          # 统一入口 (server 渲染 + CLI 管理 + hook 入口)
-  install.ps1      # 一键安装脚本 (PowerShell)
-  sounds/          # 提示音文件目录
-    .gitkeep
-  README.md
+```powershell
+pip install pyinstaller
+pyinstaller setup.spec          # → dist/ClaudeLights-Setup.exe （约 8MB）
 ```
 
 ---

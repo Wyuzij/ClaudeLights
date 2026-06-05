@@ -1,18 +1,20 @@
 <#
   ClaudeLights 一键安装脚本
-  用法: powershell -ExecutionPolicy Bypass -File install.ps1 [-ExePath .\claude-lights.exe]
+  用法: powershell -ExecutionPolicy Bypass -File install.ps1 [-ExePath .\claude-lights.exe] [-WithClient]
   支持: PowerShell 终端 + VSCode Claude Code Agent (自动懒创建)
+  新版: 多文件模块化架构 + 可选 GUI 管理客户端
 #>
 param(
     [string]$InstallDir = "$env:USERPROFILE\.claude-lights",
-    [string]$ExePath = ""  # 如果提供 exe, 则不需要 Python/PySide6
+    [string]$ExePath = "",      # 如果提供 exe, 则不需要 Python/PySide6
+    [switch]$WithClient         # 同时安装 GUI 管理客户端
 )
 
 $ErrorActionPreference = "Stop"
 Write-Host "`n  ClaudeLights Installer`n" -ForegroundColor Cyan
 
 $useExe = (Test-Path $ExePath)
-$BIN = if ($useExe) { $ExePath } else { "python `"$InstallDir\main.py`"" }
+$BIN = if ($useExe) { $ExePath } else { python "$InstallDir\main.py" }
 
 # ---- 1. 复制文件 ----
 Write-Host "[1/4] 安装文件到 $InstallDir ..."
@@ -23,17 +25,33 @@ if ($useExe) {
     Copy-Item $ExePath "$InstallDir\claude-lights.exe" -Force
     Write-Host "       已安装 claude-lights.exe"
 } else {
-    @("main.py") | ForEach-Object { Copy-Item "$src\$_" "$InstallDir\$_" -Force }
-    Write-Host "       已安装 main.py"
+    @("main.py", "core.py", "light_server.py") | ForEach-Object { Copy-Item "$src\$_" "$InstallDir\$_" -Force }
+    Write-Host "       已安装 main.py, core.py, light_server.py"
+}
+
+# 复制 sounds 目录
+$soundsSrc = "$src\sounds"
+$soundsDst = "$InstallDir\sounds"
+if (Test-Path $soundsSrc) {
+    New-Item -ItemType Directory -Force $soundsDst | Out-Null
+    Copy-Item "$soundsSrc\*" $soundsDst -Force -ErrorAction SilentlyContinue
+    Write-Host "       已复制声音文件"
+}
+
+# 可选: 安装客户端
+if ($WithClient) {
+    Copy-Item "$src\client.py" "$InstallDir\client.py" -Force
+    Copy-Item "$src\client.pyw" "$InstallDir\client.pyw" -Force -ErrorAction SilentlyContinue
+    Write-Host "       已安装 GUI 管理客户端"
 }
 
 # ---- 2. 依赖 ----
 if ($useExe) {
     Write-Host "[2/4] (exe 模式, 跳过依赖安装)"
 } else {
-    Write-Host "[2/4] 安装 PySide6 ..."
-    pip install PySide6 -q 2>&1 | Out-Null
-    Write-Host "       PySide6 已安装"
+    Write-Host "[2/4] 安装 PySide6 + pygame ..."
+    pip install PySide6 pygame -q 2>&1 | Out-Null
+    Write-Host "       PySide6 + pygame 已安装"
 }
 
 # ---- 3. 配置 PowerShell Profile ----
@@ -91,16 +109,16 @@ if (Test-Path $settingsPath) {
         SessionEnd = @{ status = "shutdown"; message = "SessionEnd" }
     }
 
-    foreach ($event in $hookDefs.Keys) {
-        $entry = $hookDefs[$event]
+    foreach ($evt in $hookDefs.Keys) {
+        $entry = $hookDefs[$evt]
         $cmd = "$BIN hook $($entry.status) `"$($entry.message)`""
 
-        if (-not $settings.hooks.$event) {
-            $settings.hooks | Add-Member -NotePropertyName $event -NotePropertyValue @() -Force
+        if (-not $settings.hooks.$evt) {
+            $settings.hooks | Add-Member -NotePropertyName $evt -NotePropertyValue @() -Force
         }
 
         $found = $false
-        foreach ($group in $settings.hooks.$event) {
+        foreach ($group in $settings.hooks.$evt) {
             foreach ($h in $group.hooks) {
                 if ($h.command -match "lights\.py hook|claude-lights.*hook") {
                     $h.command = $cmd
@@ -109,10 +127,10 @@ if (Test-Path $settingsPath) {
             }
         }
         if (-not $found) {
-            if ($settings.hooks.$event.Count -eq 0) {
-                $settings.hooks.$event = @(@{ matcher = ""; hooks = @() })
+            if ($settings.hooks.$evt.Count -eq 0) {
+                $settings.hooks.$evt = @(@{ matcher = ""; hooks = @() })
             }
-            $settings.hooks.$event[0].hooks += @{
+            $settings.hooks.$evt[0].hooks += @{
                 type = "command"
                 command = $cmd
                 timeout = 3
@@ -130,3 +148,6 @@ if (Test-Path $settingsPath) {
 
 Write-Host "`n  安装完成! 新开 PowerShell 窗口, 输入 claude 启动`n" -ForegroundColor Green
 Write-Host "  手动控制: $BIN {set|list|stop} ...`n"
+if ($WithClient) {
+    Write-Host "  GUI 客户端: python $InstallDir\client.pyw`n" -ForegroundColor Cyan
+}
