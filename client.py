@@ -1626,9 +1626,10 @@ function claude {{
 
                 if "ClaudeLights auto-start" in existing:
                     import re
+                    new_func = func.strip()
                     new_content = re.sub(
                         r'# ClaudeLights auto-start.*?(?=\n# ClaudeLights|\n# [A-Z]|\Z)',
-                        func.strip(),
+                        lambda _: new_func,
                         existing,
                         flags=re.DOTALL,
                     )

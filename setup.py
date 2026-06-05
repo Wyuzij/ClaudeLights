@@ -76,23 +76,40 @@ def get_embedded_files():
         "README.md",
     ]
 
+    # When bundled by PyInstaller, _MEIPASS contains our datas=(file, '.') files.
+    # PyInstaller 6.x may extract them directly under _MEIPASS or a sub-tree.
+    if getattr(sys, 'frozen', False):
+        # Walk _MEIPASS to find all embedded files — more robust than guessing layout.
+        meipass = sys._MEIPASS
+        for root, dirs, filenames in os.walk(meipass):
+            rel_dir = os.path.relpath(root, meipass)
+            for fn in filenames:
+                if fn in project_names:
+                    rel = fn  # flat layout: file is directly in _MEIPASS or its root
+                else:
+                    rel = os.path.join(rel_dir, fn) if rel_dir != '.' else fn
+                fp = os.path.join(root, fn)
+                if fn in project_names or fn.endswith(('.mp3', '.wav')):
+                    _FILE_LIST[os.path.normpath(rel)] = fp
+
+    # Also check development directories (script dir + cwd)
     for fname in project_names:
         for src_dir in _SOURCE_DIRS:
             fp = os.path.join(src_dir, fname)
-            if os.path.isfile(fp):
+            if os.path.isfile(fp) and fname not in _FILE_LIST:
                 _FILE_LIST[fname] = fp
                 break
 
-    # Sounds directory — look for sounds/ subdir in any source dir
-    for src_dir in _SOURCE_DIRS:
-        sounds_src = os.path.join(src_dir, "sounds")
+    # Sounds directory
+    for base in _SOURCE_DIRS:
+        sounds_src = os.path.join(base, "sounds")
         if os.path.isdir(sounds_src):
             for fn in os.listdir(sounds_src):
                 fp = os.path.join(sounds_src, fn)
-                if os.path.isfile(fp) and os.path.join("sounds", fn) not in _FILE_LIST:
-                    _FILE_LIST[os.path.join("sounds", fn)] = fp
-            if sounds_src:
-                break  # found sounds, stop looking
+                key = os.path.join("sounds", fn)
+                if os.path.isfile(fp) and key not in _FILE_LIST:
+                    _FILE_LIST[key] = fp
+            break  # first match wins
 
     return _FILE_LIST
 
@@ -249,9 +266,10 @@ function claude {{
                     existing = f.read()
 
             if "ClaudeLights auto-start" in existing:
+                new_func = func.strip()
                 new_content = re.sub(
-                    r'(?s)# ClaudeLights auto-start.*?(?=# ClaudeLights|\n# [A-Z]|\Z)',
-                    func.strip(),
+                    r'(?s)# ClaudeLights auto-start.*?(?=\n# ClaudeLights|\n# [A-Z]|\Z|\Z)',
+                    lambda _: new_func,
                     existing,
                 )
             else:
