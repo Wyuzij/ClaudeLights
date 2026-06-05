@@ -6,9 +6,9 @@ status-*.json
 # Build
 build/
 dist/
-*.spec
 __pycache__/
 *.pyc
+*.spec
 
 # Claude Code local config
 .claude/
