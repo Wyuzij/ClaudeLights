@@ -1529,12 +1529,22 @@ class MainWindow:
             errors.append(f"Copy files: {e}")
 
         # Step 3: Install Python dependencies
-        update_step(3, "Installing Python dependencies (PySide6, pygame)...")
+        update_step(3, "Installing Python dependencies (PySide6~100MB, 请耐心等待)...")
+        QApplication.processEvents()
         try:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "PySide6", "pygame", "-q"],
-                capture_output=True, timeout=120,
+            r = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "PySide6", "pygame",
+                 "--no-input", "--progress-bar", "on"],
+                capture_output=True, timeout=600,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
+            if r.returncode != 0:
+                err = r.stderr.decode("utf-8", errors="replace")
+                out = r.stdout.decode("utf-8", errors="replace")
+                detail = err or out or ""
+                errors.append(f"pip install: {detail[-300:]}")
+        except subprocess.TimeoutExpired:
+            errors.append("pip install: 下载超时，请检查网络连接并重试")
         except Exception as e:
             errors.append(f"pip install: {e}")
 

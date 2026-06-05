@@ -19,6 +19,7 @@ from tkinter import ttk, messagebox
 # Constants
 # ============================================================
 INSTALL_DIR = os.path.expanduser("~/.claude-lights")
+SETUP_LOCK = os.path.join(tempfile.gettempdir(), "claude-lights-setup.lock")
 
 # When bundled by PyInstaller, sys._MEIPASS is the temp dir containing bundled files.
 # When run from source, use the script's own directory.
@@ -26,6 +27,12 @@ if getattr(sys, 'frozen', False):
     SCRIPT_DIR = sys._MEIPASS
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Fallback: also check current working directory (for direct invocation)
+_SOURCE_DIRS = [SCRIPT_DIR]
+_cwd = os.getcwd()
+if _cwd not in _SOURCE_DIRS:
+    _SOURCE_DIRS.append(_cwd)
 
 # Colors — dark theme
 C = {
@@ -52,15 +59,14 @@ _FILE_LIST = None  # cached
 def get_embedded_files():
     """
     Return {relpath: full_source_path} for all files to install.
-    Only scans the known project files (not PyInstaller internals).
+    Scans known project files across multiple possible source directories.
     """
     global _FILE_LIST
     if _FILE_LIST is not None:
         return _FILE_LIST
 
     _FILE_LIST = {}
-    project_names = {
-        # name in SCRIPT_DIR -> desired name in install dir
+    project_names = [
         "core.py",
         "light_server.py",
         "main.py",
@@ -68,20 +74,25 @@ def get_embedded_files():
         "client.pyw",
         "install.ps1",
         "README.md",
-    }
+    ]
 
     for fname in project_names:
-        fp = os.path.join(SCRIPT_DIR, fname)
-        if os.path.isfile(fp):
-            _FILE_LIST[fname] = fp
-
-    # Sounds directory — look for sounds/ subdir
-    sounds_src = os.path.join(SCRIPT_DIR, "sounds")
-    if os.path.isdir(sounds_src):
-        for fn in os.listdir(sounds_src):
-            fp = os.path.join(sounds_src, fn)
+        for src_dir in _SOURCE_DIRS:
+            fp = os.path.join(src_dir, fname)
             if os.path.isfile(fp):
-                _FILE_LIST[os.path.join("sounds", fn)] = fp
+                _FILE_LIST[fname] = fp
+                break
+
+    # Sounds directory — look for sounds/ subdir in any source dir
+    for src_dir in _SOURCE_DIRS:
+        sounds_src = os.path.join(src_dir, "sounds")
+        if os.path.isdir(sounds_src):
+            for fn in os.listdir(sounds_src):
+                fp = os.path.join(sounds_src, fn)
+                if os.path.isfile(fp) and os.path.join("sounds", fn) not in _FILE_LIST:
+                    _FILE_LIST[os.path.join("sounds", fn)] = fp
+            if sounds_src:
+                break  # found sounds, stop looking
 
     return _FILE_LIST
 
@@ -126,6 +137,23 @@ class Installer:
 
     def _extract_files(self):
         files = get_embedded_files()
+        if not files:
+            searched = ", ".join(_SOURCE_DIRS)
+            self.log(f"  ⚠ 未找到任何项目文件（搜索路径: {searched}）")
+            self.log(f"  ▸ 当前工作目录: {os.getcwd()}")
+            self.log(f"  ▸ SCRIPT_DIR: {SCRIPT_DIR}")
+            self.log(f"  ▸ 将尝试从当前目录复制...")
+            # Last-resort: try CWD for everything
+            cwd = os.getcwd()
+            for fn in ["core.py", "light_server.py", "main.py"]:
+                fp = os.path.join(cwd, fn)
+                if os.path.isfile(fp):
+                    files[fn] = fp
+
+        if not files:
+            self.log(f"  ✗ 无法找到源文件，安装无法继续")
+            raise RuntimeError("未找到项目文件")
+
         os.makedirs(INSTALL_DIR, exist_ok=True)
 
         count = 0
@@ -143,18 +171,47 @@ class Installer:
 
     def _install_deps(self):
         deps = ["PySide6", "pygame"]
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
         for dep in deps:
             if self._cancelled:
                 return
-            self.log(f"  ▸ pip install {dep}...")
-            r = subprocess.run(
-                [sys.executable, "-m", "pip", "install", dep, "-q", "--no-input"],
-                capture_output=True, timeout=300,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            self.log(f"  ▸ pip install {dep} (PySide6 ~100MB, 下载需要几分钟)...")
+
+            # Use Popen + real-time output forwarding so the user can see progress.
+            # Without this, a blank log for 3-5 minutes looks like it's frozen.
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "pip", "install", dep, "--no-input",
+                 "--progress-bar", "on"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, creationflags=creationflags,
             )
-            if r.returncode != 0:
-                stderr = r.stderr.decode("utf-8", errors="replace")[-200:]
-                raise RuntimeError(f"pip install {dep} 失败: {stderr}")
+
+            # Read lines with timeout — show key lines to user
+            last_log = time.time()
+            try:
+                for line in iter(proc.stdout.readline, ""):
+                    if self._cancelled:
+                        proc.terminate()
+                        proc.wait()
+                        return
+                    line = line.strip()
+                    if line:
+                        # Forward every few lines or important ones
+                        if any(kw in line for kw in ("Downloading", "Installing", "Successfully",
+                                                      "Requirement", "ERROR", "error", "kB", "MB")):
+                            self.log(f"    {line}")
+                            last_log = time.time()
+                        # If no interesting lines for 15s, show something
+                        elif time.time() - last_log > 15:
+                            self.log(f"    [下载中...]")
+                            last_log = time.time()
+            except Exception:
+                pass
+
+            rc = proc.wait()
+            if rc != 0:
+                raise RuntimeError(f"pip install {dep} 失败 (exit code {rc})")
             self.log(f"  ✓ {dep} 已安装")
 
     def _configure_profile(self):
@@ -398,6 +455,9 @@ class SetupApp(tk.Tk):
     # Page 2: Installing (progress + log)
     # ================================================================
     def _start_install(self):
+        # Prevent re-entry — double-click or rapid clicks
+        if getattr(self, '_installing', False):
+            return
         self._clear()
         self._installing = True
 
@@ -510,6 +570,19 @@ class SetupApp(tk.Tk):
 
     def _launch_client(self):
         """Launch the management client after successful install."""
+        # Verify PySide6 is actually importable before attempting launch
+        try:
+            subprocess.run(
+                [sys.executable, "-c", "import PySide6"],
+                capture_output=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+        except Exception:
+            self._append_log("\n✗ PySide6 未正确安装, 无法启动管理客户端")
+            self._append_log("  请手动运行: pip install PySide6 pygame")
+            self._append_log("  然后运行: python ~/.claude-lights/client.pyw")
+            return
+
         client_py = os.path.join(INSTALL_DIR, "client.pyw")
         if not os.path.exists(client_py):
             client_py = os.path.join(INSTALL_DIR, "client.py")
@@ -522,6 +595,7 @@ class SetupApp(tk.Tk):
                 self._append_log("\n✓ 管理客户端已启动（查看系统托盘）")
             except Exception as e:
                 self._append_log(f"\n✗ 启动客户端失败: {e}")
+                self._append_log(f"  请手动运行: python {client_py}")
         else:
             self._append_log("\n✗ 未找到客户端文件，请检查安装目录")
 
@@ -537,8 +611,22 @@ def main():
         messagebox.showerror("错误", "需要 Python 3.8 或更高版本。\n当前版本: " + sys.version)
         sys.exit(1)
 
-    app = SetupApp()
-    app.mainloop()
+    # Single-instance lock — prevent multiple setup wizards from opening
+    try:
+        lock_fd = os.open(SETUP_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(lock_fd)
+    except FileExistsError:
+        messagebox.showinfo("ClaudeLights", "安装向导已在运行中。\n请查看已打开的安装窗口。")
+        sys.exit(0)
+
+    try:
+        app = SetupApp()
+        app.mainloop()
+    finally:
+        try:
+            os.remove(SETUP_LOCK)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
