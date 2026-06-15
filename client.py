@@ -1811,6 +1811,9 @@ function claude {{
 # Entry point
 # ============================================================
 def main():
+    # Ensure install directory exists before any lock operations
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+
     # Single instance check
     import core as c
     if not c._acquire_lock(timeout=0.5):

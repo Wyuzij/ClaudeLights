@@ -59,6 +59,7 @@ def _config_path():
 def _acquire_lock(timeout=5.0):
     """File lock to prevent concurrent hook race conditions. With deadlock detection."""
     lp = _lock_path()
+    os.makedirs(BASE, exist_ok=True)
     deadline = time.time() + timeout
     while True:
         try:
@@ -378,6 +379,17 @@ def start_light(lid=None):
     This spawns a Python subprocess running main.py server --id <lid>.
     """
     lid = lid or _next_id()
+    # Defensive: if a zombie process for this lid is already running, kill it first
+    pidf_path = _pidf(lid)
+    if os.path.exists(pidf_path):
+        try:
+            with open(pidf_path) as f:
+                old_pid = int(f.read().strip())
+            if _is_alive(old_pid):
+                # Existing process is alive — stop it (force-kills if needed) before replacing
+                stop_light(lid)
+        except Exception:
+            pass
     _write(lid, "idle", "Ready")
     main_py = os.path.join(BASE, "main.py")
     if not os.path.exists(main_py):
@@ -395,24 +407,58 @@ def start_light(lid=None):
     return lid
 
 
+def _force_kill(pid):
+    """Forcefully terminate a process by PID. Cross-platform."""
+    try:
+        if sys.platform == "win32":
+            # Windows: TerminateProcess with PROCESS_TERMINATE access
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+            if h:
+                k32.TerminateProcess(h, 1)
+                k32.CloseHandle(h)
+                return True
+        else:
+            import signal
+            os.kill(pid, signal.SIGKILL)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def stop_light(lid):
     """Stop a specific light and clean up its files."""
+    # Read the server PID before writing shutdown (so we have it for force kill)
+    server_pid = 0
+    if os.path.exists(_pidf(lid)):
+        try:
+            with open(_pidf(lid)) as f:
+                server_pid = int(f.read().strip())
+        except Exception:
+            pass
+
     _write(lid, "shutdown")
+
+    # Graceful shutdown: wait for the server to read "shutdown" and exit
     waited = 0.0
-    while waited < 4.0:
+    while waited < 4.0 and server_pid > 0:
         time.sleep(0.3)
         waited += 0.3
-        sf = _sf(lid)
-        if not os.path.exists(sf):
+        if not _is_alive(server_pid):
+            server_pid = 0  # Mark as dead
             break
-        if os.path.exists(_pidf(lid)):
-            try:
-                with open(_pidf(lid)) as f:
-                    pid = int(f.read().strip())
-                if not _is_alive(pid):
-                    break
-            except Exception:
-                break
+        # If status file was cleaned up externally, stop waiting
+        if not os.path.exists(_sf(lid)):
+            break
+
+    # Force kill if the server is still alive after graceful timeout
+    if server_pid > 0 and _is_alive(server_pid):
+        _force_kill(server_pid)
+        # Brief wait for OS to reap the process
+        time.sleep(0.3)
+
+    # Clean up files
     for p in [_sf(lid), _pidf(lid)]:
         if os.path.exists(p):
             try:
@@ -470,6 +516,17 @@ def shutdown_all():
 def restart_light(lid):
     """Restart a light: stop it, then start a new one with the same ID."""
     stop_light(lid)
+    # Double-check no zombie remains (stop_light force-kills, but be defensive)
+    pidf_path = _pidf(lid)
+    if os.path.exists(pidf_path):
+        try:
+            with open(pidf_path) as f:
+                old_pid = int(f.read().strip())
+            if _is_alive(old_pid):
+                _force_kill(old_pid)
+            os.remove(pidf_path)
+        except Exception:
+            pass
     time.sleep(0.5)
     _write(lid, "idle", "Ready")
     main_py = os.path.join(BASE, "main.py")
@@ -519,6 +576,18 @@ def _lazy_start(lid_hint, status, msg):
                     pass
 
         lid = lid_hint or _next_id()
+        # Defensive: kill any zombie process for this lid before creating a new one
+        old_pidf = _pidf(lid)
+        if os.path.exists(old_pidf):
+            try:
+                with open(old_pidf) as f:
+                    old_pid = int(f.read().strip())
+                if _is_alive(old_pid):
+                    _force_kill(old_pid)
+                    time.sleep(0.2)
+                os.remove(old_pidf)
+            except Exception:
+                pass
         if sid:
             with open(ssf, "w") as f:
                 f.write(lid)

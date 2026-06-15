@@ -2,6 +2,8 @@
 status-*.json
 .pid-*
 .map-*
+.session-*
+.lock
 
 # Build
 build/
