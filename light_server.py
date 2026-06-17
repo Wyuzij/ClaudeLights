@@ -35,7 +35,7 @@ def _play_complete_sound(wait=True):
 
 
 def server_main():
-    from PySide6.QtCore import Qt, QTimer, QPointF
+    from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
     from PySide6.QtGui import (
         QPainter, QColor, QPen, QFont, QPainterPath,
         QRadialGradient, QLinearGradient,
@@ -86,17 +86,20 @@ def server_main():
             self.setFixedSize(WW, WH)
             self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
             self.setAttribute(Qt.WA_TranslucentBackground, True)
-            self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             self.setStyleSheet("background: transparent;")
             self.setWindowOpacity(WINDOW_OPACITY)
             if sys.platform == "win32":
                 hwnd = int(self.winId())
                 GWL_EXSTYLE = -20
-                WS_EX_TRANSPARENT = 0x00000020
                 WS_EX_LAYERED = 0x00080000
                 user32 = ctypes.windll.user32
                 ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT | WS_EX_LAYERED)
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED)
+
+            # Close button state
+            self._close_rect = QRectF(WW - 18, 0, 16, 16)
+            self._close_hovered = False
+            self.setMouseTracking(True)
 
             try:
                 n = int(lid.split("-")[-1])
@@ -191,6 +194,20 @@ def server_main():
                             os.remove(mf)
                 except Exception:
                     pass
+
+        def mousePressEvent(self, event):
+            """Close button click → shutdown light."""
+            if event.button() == Qt.LeftButton and self._close_rect.contains(event.pos()):
+                self._cleanup()
+                QApplication.quit()
+
+        def mouseMoveEvent(self, event):
+            """Track hover state for close button highlight."""
+            in_close = self._close_rect.contains(event.pos())
+            if in_close != self._close_hovered:
+                self._close_hovered = in_close
+                self.setCursor(Qt.PointingHandCursor if in_close else Qt.ArrowCursor)
+                self.update()
 
         def _read(self):
             try:
@@ -317,6 +334,17 @@ def server_main():
             f0.setLetterSpacing(QFont.AbsoluteSpacing, 0.5)
             p.setFont(f0)
             p.drawText(0, 0, WW, 15, Qt.AlignHCenter, self.lid)
+
+            # Close button — top-right corner
+            close_alpha = 200 if self._close_hovered else 60
+            if self._close_hovered:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(255, 255, 255, 20))
+                p.drawRoundedRect(self._close_rect, 4, 4)
+            f_btn = QFont("Segoe UI", 8)
+            p.setFont(f_btn)
+            p.setPen(QPen(QColor(0xFF, 0xFF, 0xFF, close_alpha)))
+            p.drawText(self._close_rect, Qt.AlignCenter, "✕")
             p.end()
 
     app = QApplication(sys.argv)
